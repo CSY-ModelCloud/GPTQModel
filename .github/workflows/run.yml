@@ -1,0 +1,50 @@
+name: Release
+
+defaults:
+  run:
+    shell: bash -le {0}
+on:
+  schedule:
+    - cron: '0 20 * * *'
+  release:
+    types: [published]
+  repository_dispatch:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: 'GitHub repo {owner}/{repo}'
+        required: false
+        default: ''
+      ref:
+        description: 'Branch, Tag or Commit SHA'
+        required: false
+        default: ''
+      pypi:
+        type: boolean
+        description: 'Release to PyPI only'
+        required: true
+        default: 'false'
+
+env:
+  CUDA_DEVICE_ORDER: PCI_BUS_ID
+  AMD_SERVER: 10.0.13.31
+  INTEL_SERVER: 10.0.23.35
+  TORCH_CUDA_ARCH_LIST: '6.0 6.1 6.2 7.0 7.5 8.0 8.6 8.9 9.0'
+  CUDA_RELEASE: 1
+
+concurrency:
+  group: ${{ github.ref }}-workflow-release
+  cancel-in-progress: true
+
+jobs:
+  release:
+    strategy:
+      fail-fast: false
+    runs-on: ubuntu-latest
+    env:
+      CUDA_RELEASE: 0
+    steps:
+      - name: Print Env
+        run: |
+          echo "action event: ${{ github.event_name }}"
+          echo "action action: ${{ github.event.action }}"
