@@ -50,3 +50,11 @@ jobs:
           echo "action action: ${{ github.event.action }}"
           echo "${{ github.event.release }}"
           echo "${{ github.event.prerelease }}"
+
+      - name: Print Prerelease
+        if: github.event.prerelease
+        run: echo "eeeeeee"
+
+      - name: Print Release
+        if: github.event.release
+        run: echo "ooooooooo"
