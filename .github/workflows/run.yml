@@ -48,3 +48,5 @@ jobs:
         run: |
           echo "action event: ${{ github.event_name }}"
           echo "action action: ${{ github.event.action }}"
+          echo "${{ github.event.release }}"
+          echo "${{ github.event.prerelease }}"
