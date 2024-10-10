@@ -178,7 +178,7 @@ jobs:
           echo "== python =="
           python --version
           echo "== nvcc =="
-          nvcc --version
+          #nvcc --version
           echo "== torch =="
           pip show torch
 
@@ -188,8 +188,12 @@ jobs:
           repository: ${{ env.repo }}
           ref: ${{ env.ref }}
 
-      # - name: Install requirements
-      #   run: pip install -r requirements.txt -i http://${{ needs.check-vm.outputs.ip }}/simple/ --trusted-host ${{ needs.check-vm.outputs.ip }}
+      - name: Install requirements
+        run: |
+          cuda_version=$(echo ${{ matrix.tag }} | grep -oP 'cuda\K[0-9.]+')
+          torch_version=$(echo ${{ matrix.tag }} | grep -oP 'torch\K[0-9.]+')
+          python_version=$(echo ${{ matrix.tag }} | grep -oP 'python\K[0-9.]+')
+          /bin/bash /tmp/init/init_env.sh $cuda_version $torch_version $python_version
 
       - name: Compile
         run: python setup.py bdist_wheel
@@ -251,7 +255,7 @@ jobs:
           echo "== python =="
           python --version
           echo "== nvcc =="
-          nvcc --version
+          #nvcc --version
           echo "== torch =="
           pip show torch
 
@@ -319,7 +323,7 @@ jobs:
           echo "== python =="
           python --version
           echo "== nvcc =="
-          nvcc --version
+          #nvcc --version
           echo "== torch =="
           pip show torch
 
