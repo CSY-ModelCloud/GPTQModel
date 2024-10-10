@@ -192,9 +192,8 @@ jobs:
         run: |
           cat <<EOF >/etc/pip.conf
           [global]
-          index-url = http://10.0.14.199/simple
-          extraindex-url = http://10.0.23.35/simple
-          trusted-host = 10.0.14.199 10.0.23.35
+          index-url = http://10.0.13.31/simple
+          trusted-host = 10.0.13.31
           root-user-action = ignore
           EOF
           cuda_version=$(echo ${{ matrix.tag }} | grep -oP 'cuda\K[0-9.]+')
