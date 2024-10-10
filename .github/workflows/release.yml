@@ -190,6 +190,13 @@ jobs:
 
       - name: Install requirements
         run: |
+          cat <<EOF >/etc/pip.conf
+          [global]
+          index-url = http://10.0.14.199/simple
+          extraindex-url = http://10.0.23.35/simple
+          trusted-host = 10.0.14.199 10.0.23.35
+          root-user-action = ignore
+          EOF
           cuda_version=$(echo ${{ matrix.tag }} | grep -oP 'cuda\K[0-9.]+')
           torch_version=$(echo ${{ matrix.tag }} | grep -oP 'torch\K[0-9.]+')
           python_version=$(echo ${{ matrix.tag }} | grep -oP 'python\K[0-9.]+')
