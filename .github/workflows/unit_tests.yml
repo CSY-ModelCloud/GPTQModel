@@ -299,6 +299,14 @@ jobs:
           echo "== torch =="
           pip show torch
 
+          echo "ls ~"
+          ls ~ || true
+          ls ~/.cache || true
+
+          echo "ls /root"
+          ls /root || true
+          ls /root/.cache || true
+
           if [ -n "${{ github.event.inputs.artifact_id }}" ]; then
             run_id="${{ github.event.inputs.artifact_id }}"
           else
