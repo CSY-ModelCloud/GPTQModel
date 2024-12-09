@@ -93,9 +93,17 @@ class TestPerplexity(unittest.TestCase):
         #  4090: [wikitext-2-raw-v1, test, text, 512, 512] data split, tinyllama ppl == 8.4790, opt ppl == 30.02
         # assert self.native_ppl < 30.5
 
+        calibration_dataset= []
+
         length = 512 if format == FORMAT.MARLIN or format == FORMAT.BITBLAS else 2048
-        traindata = load_dataset(dataset_path, dataset_name, split=dataset_split).filter(lambda x: len(x[dataset_column]) >= length)
-        calibration_dataset = [tokenizer(example[dataset_column]) for example in traindata.select(range(1024))]
+        traindata = load_dataset(dataset_path, dataset_name, split=dataset_split)
+        for example in traindata:
+            if len(calibration_dataset) > 1024:
+                break
+            data = tokenizer(example[dataset_column])
+            if len(data) >= length:
+                calibration_dataset.append(data)
+
         return calibration_dataset, native_ppl
 
     @parameterized.expand(
