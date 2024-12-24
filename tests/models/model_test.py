@@ -1,7 +1,9 @@
 # -- do not touch
+import gc
 import os
 import sys
 
+from gptqmodel.utils.model import MODALITY
 
 if sys.platform == "darwin":
     os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
@@ -19,8 +21,8 @@ import unittest  # noqa: E402
 import torch.cuda  # noqa: E402
 from datasets import load_dataset  # noqa: E402
 from lm_eval.utils import make_table  # noqa: E402
-from ovis.ovis_calibration_dataset import get_calib_dataset  # noqa: E402
-from transformers import AutoTokenizer  # noqa: E402
+from ovis.image_to_test_dataset import get_calib_dataset  # noqa: E402
+from transformers import AutoTokenizer, AutoProcessor  # noqa: E402
 
 from gptqmodel import BACKEND, GPTQModel  # noqa: E402
 from gptqmodel.nn_modules.qlinear import BaseQuantLinear  # noqa: E402
@@ -105,7 +107,7 @@ class ModelTest(unittest.TestCase):
         if expected_kernels:
             assert modules == expected_kernels, f"kernels are different with expected. found: {modules}. expected: {expected_kernels}"
 
-    def quantModel(self, model_id_or_path, trust_remote_code=False, torch_dtype="auto", need_eval=True, **kwargs):
+    def quantModel(self, model_id_or_path, trust_remote_code=False, torch_dtype="auto", need_eval=True, batch_size: int=4, **kwargs):
         quantize_config = QuantizeConfig(
             bits=4,
             group_size=128,
@@ -125,8 +127,8 @@ class ModelTest(unittest.TestCase):
 
         tokenizer = self.load_tokenizer(model_id_or_path, trust_remote_code=trust_remote_code)
 
-        is_ovis_model = "Ovis" in model_id_or_path
-        calibration_dataset = self.load_dataset(tokenizer) if not is_ovis_model else get_calib_dataset(model)
+        is_image_to_text_model = MODALITY.IMAGE_TO_TEXT in model.modality
+        calibration_dataset = get_calib_dataset(model) if is_image_to_text_model else self.load_dataset(tokenizer)
 
         # mpt model need
         if not model.config.pad_token_id:
@@ -135,8 +137,12 @@ class ModelTest(unittest.TestCase):
             model.config.eos_token_id = tokenizer.eos_token_id or 0
 
         is_quantized = model.quantized
+
+        # ovis cannot load processor
+        is_ovis_model = model.__class__.__name__ == "OvisGPTQ"
+        need_create_processor = is_image_to_text_model and not is_ovis_model
         if not is_quantized:
-            model.quantize(calibration_dataset, batch_size=4)
+            model.quantize(calibration_dataset, batch_size=batch_size)
 
             self.check_kernel(model, self.KERNEL_QUANT)
 
@@ -144,13 +150,23 @@ class ModelTest(unittest.TestCase):
                 model.save(tmpdirname)
                 tokenizer.save_pretrained(tmpdirname)
                 q_model, q_tokenizer = self.loadQuantModel(tmpdirname, trust_remote_code=trust_remote_code)
-
+                if need_create_processor:
+                    processor = AutoProcessor.from_pretrained(tmpdirname)
+        else:
+            if need_create_processor:
+                processor = AutoProcessor.from_pretrained(model_id_or_path)
         if not is_quantized:
             del model
             torch_empty_cache()
-            return q_model, q_tokenizer
+            if need_create_processor:
+                return q_model, q_tokenizer, processor
+            else:
+                return q_model, q_tokenizer
         else:
-            return model, tokenizer
+            if need_create_processor:
+                return model, tokenizer, processor
+            else:
+                return model, tokenizer
 
     def loadQuantModel(self, model_id_or_path, trust_remote_code=False, tokenizer_path=None):
         if tokenizer_path is None:
@@ -171,7 +187,7 @@ class ModelTest(unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory() as tmp_dir:
                 if self.USE_VLLM:
-                    model_args = f"pretrained={model.model_id_or_path},dtype=auto,gpu_memory_utilization=0.8,tensor_parallel_size=1,trust_remote_code={trust_remote_code},max_model_len={self.MODEL_MAX_LEN}"
+                    model_args = f"pretrained={model.model_local_path},dtype=auto,gpu_memory_utilization=0.8,tensor_parallel_size=1,trust_remote_code={trust_remote_code},max_model_len={self.MODEL_MAX_LEN}"
                 else:
                     model_args = ""
                 results = lm_eval(
@@ -200,8 +216,8 @@ class ModelTest(unittest.TestCase):
                     if metric != 'alias' and 'stderr' not in metric
                 }
                 print(task_results)
-                if delete_quantized_model and model.model_id_or_path.startswith("/tmp") and os.path.exists(model.model_id_or_path):
-                    shutil.rmtree(model.model_id_or_path)
+                if delete_quantized_model and model.model_local_path.startswith("/tmp") and os.path.exists(model.model_local_path):
+                    shutil.rmtree(model.model_local_path)
                 return task_results
         except BaseException as e:
             if isinstance(e, torch.OutOfMemoryError):

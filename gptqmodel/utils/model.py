@@ -9,6 +9,7 @@ import re
 import shutil
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from enum import Enum
 from typing import Dict, List, Optional, Tuple, Type, Union
 
 import accelerate
@@ -683,9 +684,18 @@ def get_checkpoints(model_id_or_path: str, extensions: List[str], possible_model
 
 
 # return the most stable tensor dtype for quantization while minimizing vram
-def auto_dtype_from_config(config: PretrainedConfig, device_map: Optional[Union[str, Dict[str, Union[int, str]]]] = None, device: Optional[Union[str, int]] = None ) -> torch.dtype:
+def auto_dtype_from_config(config: PretrainedConfig,
+                           device_map: Optional[Union[str, Dict[str, Union[int, str]]]] = None,
+                           device: Optional[Union[str, int]] = None,
+                           quant_inference: bool = False) -> torch.dtype:
+    if quant_inference and device != DEVICE.CPU:
+        return torch.float16
+
     # TODO mps has errors with bfloat16, lock to float16 for now
-    if sys.platform == "darwin" or "mps" in [device, device_map] or (isinstance(device_map, Dict) and "mps" in device_map.values()):
+    if sys.platform == "darwin" or "mps" in [device, device_map] or (
+            isinstance(device_map, Dict) and "mps" in device_map.values()):
+        return torch.float16
+    elif device == DEVICE.XPU:
         return torch.float16
 
     dtype = getattr(config, "torch_dtype")
@@ -779,3 +789,8 @@ def check_requires_version(requires_version, current_version):
         return OPERATOR_MAP[op_symbol](current_version, required_version)
     else:
         return None
+
+class MODALITY(str, Enum):
+    TEXT = "text"
+    IMAGE_TO_TEXT = "image_to_text"
+    # TEXT_TO_IMAGE = "text_to_image"
