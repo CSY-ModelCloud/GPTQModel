@@ -422,6 +422,7 @@ jobs:
           fi
           echo "===== install dist/whl ====="
           uv pip install dist/*.whl
+          uv pip install outlines==0.0.46
 
       - name: Clean cache
         if: always()
