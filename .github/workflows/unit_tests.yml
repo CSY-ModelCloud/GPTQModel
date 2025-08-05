@@ -343,7 +343,7 @@ jobs:
 
       - name: Download source from github
         if: env.SOURCE_DOWNLOADED == '' && !cancelled()
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: source
           path: dist
@@ -375,7 +375,7 @@ jobs:
 
       - name: Download artifact from github
         if: env.WHL_DOWNLOADED == '' && !cancelled()
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: whl
           path: dist
@@ -501,7 +501,7 @@ jobs:
 
       - name: Download source from github
         if: env.SOURCE_DOWNLOADED == '' && !cancelled()
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: source
           path: dist
@@ -533,7 +533,7 @@ jobs:
 
       - name: Download artifact from github
         if: env.WHL_DOWNLOADED == '' && !cancelled()
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: whl
           path: dist
