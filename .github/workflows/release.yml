@@ -426,7 +426,7 @@ jobs:
           fi
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         continue-on-error: ${{ env.UPLOADED == '1' }}
         with:
           overwrite: true
@@ -491,7 +491,7 @@ jobs:
           fi
 
       - name: Upload to artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         continue-on-error: ${{ env.UPLOADED == '1' }}
         with:
           name: ${{ env.WHL_NAME }}
@@ -560,7 +560,7 @@ jobs:
           git fetch origin pull/${PR_NUMBER}/head:pr-${PR_NUMBER}
           git checkout pr-${PR_NUMBER}
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: 3.13
           cache: 'pip'
@@ -582,7 +582,7 @@ jobs:
           twine check dist/$whl
 
       - name: Upload to artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: ${{ env.WHL_NAME }}
           path: dist/${{ env.WHL_NAME }}
