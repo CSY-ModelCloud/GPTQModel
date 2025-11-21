@@ -122,7 +122,7 @@ jobs:
 
     steps:
       - name: Checkout Codes
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           repository: ${{ env.repo }}
           ref: ${{ env.ref }}
@@ -215,7 +215,7 @@ jobs:
 
     steps:
       - name: Checkout Codes
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           repository: ${{ env.repo }}
           ref: ${{ env.ref }}
@@ -280,7 +280,7 @@ jobs:
         run: curl -s -F "runid=${{ github.run_id }}" -F "repo=${{ env.repo }}" -F "ref=${{ env.ref }}" -F "sha256=${{ env.SOURCE_HASH }}" -F "file=@dist/gptqmodel_source.tar.gz" http://$RUNNER/gpu/whl/upload
 
       - name: Upload source to github artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: source
           path: dist/gptqmodel_source.tar.gz
@@ -311,7 +311,7 @@ jobs:
 
       - name: Upload wheel to github artifact
         if: github.event.inputs.artifact_id == '' && !cancelled()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: whl
           path: dist/${{ env.WHL_NAME }}
@@ -342,7 +342,7 @@ jobs:
     if: always() && !cancelled() && (needs.build.result == 'success' || github.event.inputs.artifact_id != '') && needs.list-test-files.outputs.torch-files != '[]'
     steps:
       - name: Checkout Codes
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           repository: ${{ env.repo }}
           ref: ${{ env.ref }}
@@ -407,7 +407,7 @@ jobs:
 
       # - name: Download source from github
       #   if: env.SOURCE_DOWNLOADED == '' && !cancelled()
-      #   uses: actions/download-artifact@v5
+      #   uses: actions/download-artifact@v6
       #   with:
       #     name: source
       #     path: dist
@@ -439,7 +439,7 @@ jobs:
 
       - name: Download artifact from github
         if: env.WHL_DOWNLOADED == '' && !cancelled()
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v6
         with:
           name: whl
           path: dist
@@ -616,7 +616,7 @@ jobs:
           ls -ahl .
 
       - name: Checkout Codes
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           repository: ${{ env.repo }}
           ref: ${{ env.ref }}
