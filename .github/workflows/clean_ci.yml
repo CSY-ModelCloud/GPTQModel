@@ -1,7 +1,5 @@
 name: Clean CI
 
-run-name: "${{ github.event.inputs.title }}"
-
 defaults:
   run:
     shell: bash -le {0}
