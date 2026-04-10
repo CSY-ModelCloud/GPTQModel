@@ -5,6 +5,8 @@ defaults:
     shell: bash -le {0}
 
 on:
+  schedule:
+    - cron: '0 16 * * 0' # UTC+8 00:00 Monday
   repository_dispatch:
   workflow_dispatch:
     inputs:
@@ -53,7 +55,7 @@ jobs:
       - name: Clean uv cache
         if:  ${{ github.event.inputs.uv == 'true' }}
         run: |
-          uv cache dir
+          uv cache clean
 
       - name: Print pip cache
         run: |
@@ -62,16 +64,16 @@ jobs:
       - name: Clean pip cache
         if:  ${{ github.event.inputs.pip == 'true' }}
         run: |
-          pip cache dir || true
+          pip cache purge || true
 
       - name: Print dist
         run: |
-          du -h /opt/dist --max-depth=0
+          find /opt/dist -mindepth 1 -maxdepth 1 -type d | wc -l
 
       - name: Clean dist
         if:  ${{ github.event.inputs.dist == 'true' }}
         run: |
-          du -h /opt/dist --max-depth=0
+          rm -rf /opt/dist/*
 
   system:
     runs-on: [ self-hosted, xeon5 ]
@@ -83,4 +85,4 @@ jobs:
       - name: Clean docker images
         if:  ${{ github.event.inputs.docker-image == 'true' }}
         run: |
-          docker images
+          docker system prune -a --force
