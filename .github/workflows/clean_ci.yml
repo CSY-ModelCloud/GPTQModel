@@ -54,7 +54,7 @@ jobs:
 
       - name: Clean pip cache
         run: |
-          pip cache dir
+          pip cache dir || true
 
       - name: Clean dist
         run: |
