@@ -48,10 +48,6 @@ jobs:
         - /monster/ci/env:/opt/env
         - /monster/ci/dist:/opt/dist
     steps:
-      - name: Print docker images
-        run: |
-          docker images
-
       - name: Clean uv cache
         run: |
           uv cache dir
