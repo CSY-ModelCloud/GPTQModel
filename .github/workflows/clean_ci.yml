@@ -76,6 +76,8 @@ jobs:
           rm -rf /opt/dist/*
 
   system:
+    needs:
+      - docker # run after docker, so make sure all images can be deleted
     runs-on: [ self-hosted, xeon5 ]
     steps:
       - name: Print docker images
