@@ -1,0 +1,72 @@
+name: Clean CI
+
+run-name: "${{ github.event.inputs.title }}"
+
+defaults:
+  run:
+    shell: bash -le {0}
+
+on:
+  repository_dispatch:
+  workflow_dispatch:
+    inputs:
+      docker-image:
+        description: 'delete all dockers'
+        required: false
+        type: boolean
+      uv:
+        description: 'clean uv cache'
+        required: false
+        type: boolean
+      pip:
+        description: 'clean pip cache'
+        required: false
+        type: boolean
+      dist:
+        description: 'clean logs/artificats'
+        required: false
+        type: boolean
+
+
+concurrency:
+  group: ${{ github.event.inputs.ref || github.ref }}-workflow-unit-tests
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  docker:
+    runs-on: [ self-hosted, xeon5 ]
+    container:
+      image: 10.0.13.31:5000/nvidia/cuda:130-ubuntu24.04_0325
+      options: --device /dev/dri --ipc=host --runtime=nvidia --gpus all
+      volumes:
+        - /monster/ci/env/entrypoint.sh:/etc/profile.d/01-entrypoint.sh
+        - /dev/dri/by-path:/dev/dri/by-path
+        - /monster/ci/uv:/opt/uv
+        - /monster/ci/env:/opt/env
+        - /monster/ci/dist:/opt/dist
+    steps:
+      - name: Print docker images
+        run: |
+          docker images
+
+      - name: Clean uv cache
+        run: |
+          uv cache dir
+
+      - name: Clean pip cache
+        run: |
+          pip cache dir
+
+      - name: Clean dist
+        run: |
+          du -h /opt/dist --max-depth=0
+
+  system:
+    runs-on: [ self-hosted, xeon5 ]
+    steps:
+      - name: Print docker images
+        run: |
+          docker images
