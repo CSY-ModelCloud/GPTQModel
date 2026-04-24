@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 ModelCloud.ai
 # SPDX-License-Identifier: Apache-2.0
-
+# GPU=-1
 import time
 
 import pytest
@@ -53,6 +53,13 @@ def test_default_jit_cuda_cflags_honors_nvcc_threads_override(monkeypatch):
     flags = default_jit_cuda_cflags()
     assert "--threads" in flags
     assert "16" in flags
+
+
+def test_default_jit_cuda_cflags_explicit_nvcc_threads_takes_precedence(monkeypatch):
+    monkeypatch.setenv("NVCC_THREADS", "8")
+    flags = default_jit_cuda_cflags(nvcc_threads=16)
+    assert "--threads" in flags
+    assert flags[flags.index("--threads") + 1] == "16"
 
 
 class _FakeProgress:

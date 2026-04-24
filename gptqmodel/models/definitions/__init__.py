@@ -26,8 +26,11 @@ from .ernie4_5 import Ernie4_5QModel
 from .ernie4_5_moe import Ernie4_5_MoeQModel
 from .gemma2 import Gemma2QModel
 from .gemma3 import Gemma3QModel
+from .gemma3n import Gemma3nForConditionalGenerationGPTQ, Gemma3nTextQModel
 from .gemma4 import Gemma4ForConditionalGenerationGPTQ, Gemma4TextQModel
 from .glm import GlmQModel
+from .glmasr import GlmASRGPTQ
+from .glm_ocr import GlmOCRGPTQ
 from .glm_moe_dsa import GlmMoeDsaQModel
 from .gpt2 import GPT2QModel
 from .gpt_bigcode import GptBigCodeQModel
@@ -67,6 +70,7 @@ from .starcoder2 import Starcoder2QModel
 from .telechat2 import TeleChat2QModel
 from .xverse import XverseQModel
 from .falcon_h1 import FalconH1QModel
+from .falcon_mamba import FalconMambaQModel
 from .pangu_alpha import PanguAlphaQModel
 from .longcat_flash import LongCatFlashQModel
 from .apertus import ApertusQModel

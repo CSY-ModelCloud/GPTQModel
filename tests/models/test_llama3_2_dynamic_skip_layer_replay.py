@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: 2026 ModelCloud.ai
 # SPDX-License-Identifier: Apache-2.0
 
-import re
 from pathlib import Path
 
+import pcre
 import pytest
 import torch
 import torch.nn as nn
@@ -20,6 +20,10 @@ LAYER0_AND_LAYER2_ONLY_NEGATIVE_MATCH = r"^model\.layers\.(?!(?:0|2)\.)\d+\."
 GPTQ_TENSOR_SUFFIXES = ("qweight", "qzeros", "scales", "g_idx")
 # Dynamically skipped layers must remain in native half precision on disk.
 HALF_PRECISION_DTYPES = {"F16", "BF16"}
+_LAYER_INDEX_RE = pcre.compile(r"\.layers\.(\d+)\.")
+_QUANTIZED_TENSOR_RE = pcre.compile(
+    r"^(model\.layers\.(\d+)\..*)\.(qweight|qzeros|scales|g_idx)$"
+)
 
 
 class TestLlama3_2DynamicSkipLayerReplay(ModelTest):
@@ -33,8 +37,6 @@ class TestLlama3_2DynamicSkipLayerReplay(ModelTest):
     NATIVE_MODEL_ID = "/monster/data/model/Llama-3.2-1B-Instruct"
     EVAL_BATCH_SIZE = 64
     DATASET_CONCAT_SIZE = 2048
-    # Keep this regression on a single deterministic CUDA device in PCI bus order.
-    PIN_CUDA_DEVICE = 0
     LOAD_BACKEND = BACKEND.MARLIN
     KERNEL_INFERENCE = {MarlinLinear}
     DYNAMIC = {
@@ -68,7 +70,7 @@ class TestLlama3_2DynamicSkipLayerReplay(ModelTest):
             "evalution_model_args": {
                 "dtype": "bfloat16",
                 "attn_implementation": "paged|flash_attention_2",
-                "device": "cuda:0",
+                "device": "cuda",
             },
             "evalution_suite_kwargs": {
                 "batch_size": 24,
@@ -112,7 +114,7 @@ class TestLlama3_2DynamicSkipLayerReplay(ModelTest):
             if not isinstance(module, BaseQuantLinear):
                 continue
 
-            layer_match = re.search(r"\.layers\.(\d+)\.", name)
+            layer_match = _LAYER_INDEX_RE.search(name)
             if layer_match is None:
                 continue
 
@@ -136,7 +138,7 @@ class TestLlama3_2DynamicSkipLayerReplay(ModelTest):
     @staticmethod
     def _layer_index_from_module_name(module_name: str) -> int | None:
         """Return the transformer layer index encoded in a module/tensor name."""
-        layer_match = re.search(r"\.layers\.(\d+)\.", module_name)
+        layer_match = _LAYER_INDEX_RE.search(module_name)
         if layer_match is None:
             return None
         return int(layer_match.group(1))
@@ -202,9 +204,8 @@ class TestLlama3_2DynamicSkipLayerReplay(ModelTest):
         assert native_linear_module_names, "Expected skipped layers to retain native linear weights in the saved model."
 
         unexpected_quantized_keys = []
-        quantized_tensor_pattern = re.compile(r"^(model\.layers\.(\d+)\..*)\.(qweight|qzeros|scales|g_idx)$")
         for tensor_name in tensor_dtypes:
-            match = quantized_tensor_pattern.match(tensor_name)
+            match = _QUANTIZED_TENSOR_RE.match(tensor_name)
             if match is None:
                 continue
             layer_idx = int(match.group(2))
@@ -284,7 +285,7 @@ class TestLlama3_2DynamicSkipLayerReplay(ModelTest):
         if eval_records and len(eval_records) == 1 and target_backend in eval_records:
             task_results = eval_records[target_backend]
         else:
-            task_results = self.lm_eval(
+            task_results = self.evaluate_model(
                 model=self.SAVE_PATH if self.SAVE_PATH else self.model,
                 trust_remote_code=self.TRUST_REMOTE_CODE,
                 delete_quantized_model=self.DELETE_QUANTIZED_MODEL,

@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 
@@ -64,11 +64,44 @@ class ForwardExecutor:
         total_rows = max(total_rows, 1)
         return total_batches, batch_row_counts, total_rows
 
+    def _moe_forward_context(
+        self,
+        *,
+        module: torch.nn.Module,
+        processor: "LoopProcessor",
+        current_subset: Optional[Dict[str, Any]],
+        ordered_module_names: Optional[List[str]],
+        apply_moe_config: bool,
+    ):
+        """Pick the MoE routing context for a forward pass."""
+
+        if not apply_moe_config:
+            # Replay forwards opt out of quant-time MoE overrides and bypass hooks.
+            return nullcontext()
+        if self.looper.moe_routing_override:
+            return self.looper.MoERoutingOverrideContext(module, self.looper.moe_routing_override)
+        if not getattr(self.looper, "moe_routing_bypass", False):
+            return nullcontext()
+
+        should_use_lifecycle = getattr(self.looper, "_should_use_moe_lifecycle", None)
+        if callable(should_use_lifecycle) and not should_use_lifecycle(module, processor):
+            return nullcontext()
+
+        return self.looper.MoELifecycleContext(
+            self.looper,
+            module,
+            processor,
+            current_subset,
+            ordered_module_names,
+        )
+
     def run(
         self,
         *,
         module: torch.nn.Module,
         processor: "LoopProcessor",
+        current_subset: Optional[Dict[str, Any]] = None,
+        ordered_module_names: Optional[List[str]] = None,
         layer_inputs: List[List[torch.Tensor]],
         layer_input_kwargs: List[Dict[str, torch.Tensor]],
         position_ids: List[torch.Tensor],
@@ -86,6 +119,7 @@ class ForwardExecutor:
         progress_total_rows: Optional[int] = None,
         force_serial: bool = False,
         preserve_module_devices: bool = False,
+        apply_moe_config: bool = True,
         select_forward_devices_fn: Callable[[Optional[torch.device]], List[torch.device]] = select_forward_devices,
     ) -> List[List[torch.Tensor]]:
         """Dispatch the cached batches through the most appropriate forward path."""
@@ -99,6 +133,8 @@ class ForwardExecutor:
             return self.run_single(
                 module=module,
                 processor=processor,
+                current_subset=current_subset,
+                ordered_module_names=ordered_module_names,
                 layer_inputs=layer_inputs,
                 layer_input_kwargs=layer_input_kwargs,
                 position_ids=position_ids,
@@ -115,6 +151,7 @@ class ForwardExecutor:
                 progress_rows_per_batch=progress_rows_per_batch,
                 progress_total_rows=progress_total_rows,
                 preserve_module_devices=preserve_module_devices,
+                apply_moe_config=apply_moe_config,
             )
 
         devices = select_forward_devices_fn(cur_layer_device)
@@ -122,6 +159,8 @@ class ForwardExecutor:
             return self.run_single(
                 module=module,
                 processor=processor,
+                current_subset=current_subset,
+                ordered_module_names=ordered_module_names,
                 layer_inputs=layer_inputs,
                 layer_input_kwargs=layer_input_kwargs,
                 position_ids=position_ids,
@@ -138,11 +177,14 @@ class ForwardExecutor:
                 progress_rows_per_batch=progress_rows_per_batch,
                 progress_total_rows=progress_total_rows,
                 preserve_module_devices=preserve_module_devices,
+                apply_moe_config=apply_moe_config,
             )
 
         return self.run_parallel(
             module=module,
             processor=processor,
+            current_subset=current_subset,
+            ordered_module_names=ordered_module_names,
             layer_inputs=layer_inputs,
             layer_input_kwargs=layer_input_kwargs,
             position_ids=position_ids,
@@ -159,6 +201,7 @@ class ForwardExecutor:
             progress_stage=progress_stage,
             progress_rows_per_batch=progress_rows_per_batch,
             progress_total_rows=progress_total_rows,
+            apply_moe_config=apply_moe_config,
         )
 
     def run_single(
@@ -166,6 +209,8 @@ class ForwardExecutor:
         *,
         module: torch.nn.Module,
         processor: "LoopProcessor",
+        current_subset: Optional[Dict[str, Any]] = None,
+        ordered_module_names: Optional[List[str]] = None,
         layer_inputs: List[List[torch.Tensor]],
         layer_input_kwargs: List[Dict[str, torch.Tensor]],
         position_ids: List[torch.Tensor],
@@ -182,6 +227,7 @@ class ForwardExecutor:
         progress_rows_per_batch: Optional[List[int]] = None,
         progress_total_rows: Optional[int] = None,
         preserve_module_devices: bool = False,
+        apply_moe_config: bool = True,
     ) -> List[List[torch.Tensor]]:
         """Run the forward pass sequentially on the current device."""
 
@@ -208,7 +254,7 @@ class ForwardExecutor:
                 # Capture input device before moving - used for output placement
                 input_device = layer_inputs[batch_idx][0].device if layer_inputs[batch_idx] else cur_layer_device
 
-                layer_input = [move_to(inp, device=exec_device) for inp in layer_inputs[batch_idx]]
+                layer_input = [nested_move_to(inp, device=exec_device) for inp in layer_inputs[batch_idx]]
 
                 raw_mask = attention_masks[batch_idx]
                 attn_tensor = raw_mask if raw_mask is None else move_to(raw_mask, device=exec_device)
@@ -249,12 +295,12 @@ class ForwardExecutor:
                 if not preserve_module_devices:
                     rehome_module_to_device(module, cur_layer_device, move_parameters=True, move_buffers=True)
 
-                with (
-                    self.looper.MoERoutingOverrideContext(module, self.looper.moe_routing_override)
-                    if self.looper.moe_routing_override
-                    else self.looper.MoELifecycleContext(self.looper, module, processor, self.looper._current_subset)
-                    if self.looper.moe_routing_bypass
-                    else nullcontext()
+                with self._moe_forward_context(
+                    module=module,
+                    processor=processor,
+                    current_subset=current_subset,
+                    ordered_module_names=ordered_module_names,
+                    apply_moe_config=apply_moe_config,
                 ):
                     module_output = None
                     try:
@@ -314,6 +360,8 @@ class ForwardExecutor:
         *,
         module: torch.nn.Module,
         processor: "LoopProcessor",
+        current_subset: Optional[Dict[str, Any]] = None,
+        ordered_module_names: Optional[List[str]] = None,
         layer_inputs: List[List[torch.Tensor]],
         layer_input_kwargs: List[Dict[str, torch.Tensor]],
         position_ids: List[torch.Tensor],
@@ -330,6 +378,7 @@ class ForwardExecutor:
         progress_stage: Optional[str] = None,
         progress_rows_per_batch: Optional[List[int]] = None,
         progress_total_rows: Optional[int] = None,
+        apply_moe_config: bool = True,
         clone_module_for_devices_fn=clone_module_for_devices,
         forward_batch_worker_fn=forward_batch_worker,
         device_thread_pool=DEVICE_THREAD_POOL,
@@ -400,13 +449,15 @@ class ForwardExecutor:
         moe_contexts = []
         try:
             for _device, replica in module_replicas.items():
-                ctx = None
-                if self.looper.moe_routing_override:
-                    ctx = self.looper.MoERoutingOverrideContext(replica, self.looper.moe_routing_override)
-                elif self.looper._should_use_moe_lifecycle(module, processor):
-                    ctx = self.looper.MoELifecycleContext(self.looper, replica, processor, self.looper._current_subset)
+                ctx = self._moe_forward_context(
+                    module=replica,
+                    processor=processor,
+                    current_subset=current_subset,
+                    ordered_module_names=ordered_module_names,
+                    apply_moe_config=apply_moe_config,
+                )
 
-                if ctx:
+                if not isinstance(ctx, nullcontext):
                     ctx.__enter__()
                     moe_contexts.append(ctx)
 
@@ -511,7 +562,8 @@ class ForwardExecutor:
                         target_device = input_device if calib_device_cfg is not None else cur_layer_device
                         # Move each batch result to its final target device as
                         # soon as the worker finishes.
-                        results[batch_idx] = move_to(module_output, device=target_device)
+                        primary = module_output[0] if isinstance(module_output, tuple) else module_output
+                        results[batch_idx] = move_to(primary, device=target_device)
                         del module_output
                     if reuse_kv and kv_next is not None and shared_kv_cache_dict.get(layer_index) is None:
                         shared_kv_cache_dict[layer_index] = nested_move_to(kv_next, device=cur_layer_device)

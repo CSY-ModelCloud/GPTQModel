@@ -64,7 +64,8 @@ class TestQwen3Moe(ModelTest):
     }
     EVAL_TASKS_FAST = ModelTest.derive_fast_eval_tasks(EVAL_TASKS_SLOW)
 
-    VRAM_STRATEGY = VramStrategy.BALANCED
+    DENSE_VRAM_STRATEGY = VramStrategy.EXCLUSIVE
+    MOE_VRAM_STRATEGY = VramStrategy.BALANCED
     MOE_CONFIG = MoEConfig(routing=ExpertsRoutingOverride())
     # TRUST_REMOTE_CODE = False
     # APPLY_CHAT_TEMPLATE = True
@@ -80,4 +81,4 @@ class TestQwen3Moe(ModelTest):
     # CALIB_NOISE_PERCENT = 0.025
 
     def test_mimo(self):
-        self.quant_lm_eval()
+        self.quantize_and_evaluate()

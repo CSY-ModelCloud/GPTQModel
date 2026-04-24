@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: 2024-2025 qubitium@modelcloud.ai
 # SPDX-License-Identifier: Apache-2.0
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
+# GPU=-1
+import tempfile
 
 from torch import nn
 from transformers import PretrainedConfig, PreTrainedModel
@@ -46,3 +48,21 @@ def test_legacy_list_tied_weights_are_normalized_to_input_embeddings():
     }
     assert model._tied_weights_keys == {"lm_head.weight": "embed_tokens.weight"}
     assert _get_tied_weight_keys(model) == ["lm_head.weight"]
+
+
+def test_legacy_list_tied_weights_allow_save_pretrained():
+    model = _LegacyTiedWeightsModel(_DummyConfig())
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        model._tied_weights_keys = ["lm_head.weight"]
+        model.get_expanded_tied_weights_keys(all_submodels=False)
+        model._tied_weights_keys = ["lm_head.weight"]
+        _hf_utils._normalize_legacy_tied_weights_keys(model)
+        model.save_pretrained(tmp_dir, state_dict={}, is_main_process=True)
+
+
+def test_normalize_legacy_tied_weights_keys_ignores_non_module_stubs():
+    class _NoModulesDummy:
+        pass
+
+    _hf_utils._normalize_legacy_tied_weights_keys(_NoModulesDummy())

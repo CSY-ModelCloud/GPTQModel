@@ -89,8 +89,24 @@ def _should_drain_finalize_futures_synchronously(
     than the weight-only paths. Letting its finalizers overlap the next layer
     can visibly ratchet active VRAM upward from layer N to N+1, so ParoQuant
     always drains per-layer finalizers synchronously.
+
+    Any multi-accelerator quantization flow can overlap layer N finalizers with
+    layer N+1 materialization/replay if we keep the default async drain. That
+    saves some wall time, but it also broadens the lifetime of device-resident
+    weights, activations, and packing state across layer boundaries. In
+    practice, the overlap is not worth the allocator pressure risk, so
+    multi-device runs drain per-layer finalizers synchronously.
     """
     if looper.gptq_model.quantize_config.wait_for_submodule_finalizers:
+        return True
+
+    quant_devices = getattr(looper, "_quant_devices", None) or []
+    active_accelerators = {
+        (device.type, device.index)
+        for device_like in quant_devices
+        if (device := normalize_device_like(device_like)) is not None and device.type != "cpu"
+    }
+    if len(active_accelerators) > 1:
         return True
     return any(isinstance(process, ParoQuantProcessor) for process, *_ in finalize_tasks)
 
@@ -160,6 +176,19 @@ def _collect_layer_forward_progress(
         forward_row_counts.extend([1] * (batch_count - len(forward_row_counts)))
 
     return batch_count, forward_row_counts, forward_total_rows
+
+
+def _collect_hook_skip_modules(planning_layer_modules: List[List[str]]) -> set[str]:
+    """Collect module paths flagged as non-quantized in module-tree planning blocks."""
+
+    skip_modules: set[str] = set()
+    for block in planning_layer_modules:
+        for module_name in block:
+            if ":!" in module_name:
+                path = module_name.split(":", 1)[0]
+                if path:
+                    skip_modules.add(path)
+    return skip_modules
 
 
 def _replay_layer_outputs(
@@ -251,9 +280,16 @@ def _replay_layer_outputs(
             progress_total_rows=replay_total_rows,
             force_serial=replay_force_serial,
             preserve_module_devices=replay_preserve_module_devices,
+            # Replay should emit next-layer activations under the model's native router.
+            # And reduce the execution time of `forward()`.
+            apply_moe_config=False,
         )
     finally:
-        if replay_modules is not None and replay_forward_device_map:
+        if (
+            replay_modules is not None
+            and replay_forward_device_map
+            and (replay_plan is None or replay_plan.restore_forward_device_overrides)
+        ):
             looper._restore_forward_device_overrides(
                 replay_modules,
                 replay_prev_devices,
@@ -350,6 +386,7 @@ def run_layer_stage(
     *,
     layers: List[torch.nn.Module],
     layer_modules: List[List[str]],
+    planning_layer_modules: List[List[str]],
     layers_prefix: Optional[str],
     fallback,
     shared_kv_cache_dict: Dict[int, torch.Tensor],
@@ -372,6 +409,7 @@ def run_layer_stage(
 
     log = logger or setup_logger()
     durable_progress_logs = live_renderables_suppressed()
+    hook_skip_modules = _collect_hook_skip_modules(planning_layer_modules)
     for layer_index in pb:
         # Iterate over every transformer layer (plus lm_head when enabled) as
         # progress-bar controlled units of work.
@@ -403,7 +441,7 @@ def run_layer_stage(
             module = layers[layer_index]
             pristine_group_module = None
 
-        looper.pause_controller.register_and_draw_progress_bar(pb, title=layer_title, subtitle="")
+        pb.title(layer_title).subtitle("").draw()
         if durable_progress_logs:
             log.info(
                 "StageLayer: start layer=%s/%s title=`%s`",
@@ -437,7 +475,11 @@ def run_layer_stage(
             if needs_group_pristine:
                 pristine_group_module = copy.deepcopy(module) if needs_pristine_group_clone else None
 
-            replace_module_with_hooked_legacy(module, quant_lm_head=looper.gptq_model.quantize_config.lm_head)
+            replace_module_with_hooked_legacy(
+                module,
+                quant_lm_head=looper.gptq_model.quantize_config.lm_head,
+                skip_module_paths=hook_skip_modules,
+            )
 
             layers[layer_index] = module
 
@@ -483,6 +525,7 @@ def run_layer_stage(
                 processor=processor,
                 module=module,
                 layer_modules=layer_modules,
+                planning_layer_modules=planning_layer_modules,
                 layer_inputs=layer_inputs,
                 full=full,
                 is_lm_head_module=is_lm_head_module,
@@ -660,7 +703,7 @@ def run_layer_stage(
                 processor.clear_cache_data()
                 processor.receive_layer_inputs(layer_outputs)
                 layer_inputs = processor.inputs_cache.layer_inputs
-                looper.pause_controller.register_and_draw_progress_bar(pb, title=layer_title, subtitle="")
+                pb.title(layer_title).subtitle("").draw()
 
             if p_index == len(looper.processors) - 1:
                 torch_sync()
@@ -911,12 +954,6 @@ def run_layer_stage(
                             layer_index if not is_lm_head_module else "lm_head",
                         )
 
-        # Check for pause after completing each layer
-        layer_info = f"layer {layer_index}" if not is_lm_head_module else "lm_head"
-        looper.pause_controller.check_pause_point(f"after {layer_info}")
-
-        # Unregister progress bar when moving to next layer
-        looper.pause_controller.unregister_progress_bar(pb)
         if durable_progress_logs:
             log.info(
                 "StageLayer: handoff complete for layer=%s",

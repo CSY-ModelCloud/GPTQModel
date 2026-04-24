@@ -197,7 +197,7 @@ class GPTQProcessor(LoopProcessor):
         # Reset peak memory stats
         #torch.cuda.reset_peak_memory_stats()
         base_title = f"Quantizing {module.name} in layer"
-        self._pause_controller.register_and_draw_progress_bar(self.pb, title=base_title, subtitle="")
+        self.draw_progress(base_title)
 
         # logger.info(f"Quantizing module START: {name}, {gptq[name].shape()}")
         ## Need to return the quantized_weight for offloading
@@ -494,6 +494,14 @@ class GPTQProcessor(LoopProcessor):
             return "foem"
         else:
             return "gptq"
+
+    def _release_host_buffers(self, *tensors: torch.Tensor) -> None:
+        """Retain the old cleanup hook for streaming tests and external callers.
+
+        Host buffers are now owned by the stream ticket lifecycle instead of a
+        dedicated GPTQProcessor pool, so release is intentionally a no-op.
+        """
+        _ = tensors
 
     def has_captured_input_ids(self, name: str) -> bool:
         """Reports whether the module saw at least one captured forward batch."""

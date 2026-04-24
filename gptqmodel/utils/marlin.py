@@ -21,6 +21,7 @@ from .cpp import (
     default_jit_cuda_cflags,
     default_torch_ops_build_root,
     detected_cuda_wheel_include_paths,
+    is_nvcc_compatible,
 )
 from .marlin_scalar_type import ScalarType
 from .rocm import IS_ROCM
@@ -41,6 +42,10 @@ _MARLIN_REQUIRED_CUDA_HEADERS = (
 )
 
 
+def _marlin_capability_supported(major: int, minor: int) -> bool:
+    return major > 7 or (major == 7 and minor >= 5)
+
+
 def _marlin_environment_error() -> str:
     if IS_ROCM:
         return "Marlin kernel is not supported on ROCm."
@@ -50,8 +55,8 @@ def _marlin_environment_error() -> str:
         major, minor = torch.cuda.get_device_capability()
     except Exception as exc:  # pragma: no cover - depends on host CUDA runtime
         return f"Marlin kernel failed to query CUDA device capability: {exc}"
-    if major < 8:
-        return f"Marlin kernel requires compute capability >= 8.0, got {major}.{minor}."
+    if not _marlin_capability_supported(major, minor):
+        return f"Marlin kernel requires compute capability >= 7.5, got {major}.{minor}."
     return ""
 
 
@@ -60,18 +65,6 @@ marlin_import_exception = _marlin_environment_error() or None
 
 def _marlin_root() -> Path:
     return Path(__file__).resolve().parents[2] / "gptqmodel_ext" / "marlin"
-
-
-def _marlin_cuda_version_at_least(major: int, minor: int) -> bool:
-    raw = getattr(torch.version, "cuda", None)
-    if not raw:
-        return False
-    try:
-        parts = raw.split(".")
-        current = (int(parts[0]), int(parts[1]) if len(parts) > 1 else 0)
-    except (TypeError, ValueError):  # pragma: no cover - depends on torch build metadata
-        return False
-    return current >= (major, minor)
 
 
 def _marlin_cuda_extra_name() -> str | None:
@@ -129,10 +122,17 @@ def _marlin_header_install_hint(error_text: str) -> str:
 
 def _ensure_generated_marlin_kernels() -> Path:
     root = _marlin_root()
-    if list(root.glob("kernel_fp16_*.cu")) and list(root.glob("kernel_bf16_*.cu")):
+    generator = root / "generate_kernels.py"
+    check_result = subprocess.run(
+        [sys.executable, str(generator), "--check"],
+        cwd=str(root),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if check_result.returncode == 0:
         return root
 
-    generator = root / "generate_kernels.py"
     result = subprocess.run(
         [sys.executable, str(generator)],
         cwd=str(root),
@@ -141,7 +141,7 @@ def _ensure_generated_marlin_kernels() -> Path:
         check=False,
     )
     if result.returncode != 0:
-        details = (result.stderr or result.stdout or "").strip()
+        details = (result.stderr or result.stdout or check_result.stderr or check_result.stdout or "").strip()
         raise RuntimeError(
             "Marlin kernel generation failed"
             + (f": {details}" if details else ".")
@@ -184,7 +184,8 @@ def _marlin_extra_cuda_cflags() -> list[str]:
         include_fatbin_compression=True,
         include_diag_suppress=True,
     )
-    if _marlin_cuda_version_at_least(12, 8):
+    # This flag is parsed by the local nvcc, not by the Torch wheel metadata.
+    if is_nvcc_compatible():
         flags.insert(0, "-static-global-template-stub=false")
     return flags
 
@@ -285,7 +286,10 @@ def _validate_marlin_device_support() -> bool:
     Returns:
         bool: indicates if CUDA device is compatible for Marlin
     """
-    return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8 and not IS_ROCM
+    if IS_ROCM or not torch.cuda.is_available():
+        return False
+    major, minor = torch.cuda.get_device_capability()
+    return _marlin_capability_supported(major, minor)
 
 
 def marlin_is_k_full(act_order: bool, is_row_parallel: bool) -> bool:

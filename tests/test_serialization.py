@@ -27,6 +27,7 @@ from gptqmodel.quantization import (  # noqa: E402
 )
 from gptqmodel.quantization.config import (  # noqa: E402  # noqa: E402
     METHOD,
+    AWQConfig,
     GGUFConfig,
     GPTAQConfig,
     HessianConfig,
@@ -92,7 +93,10 @@ class TestSerialization(unittest.TestCase):
                 chunk_bytes=4096,
                 staging_dtype=torch.bfloat16,
             ),
-            vram_strategy=VramStrategy.BALANCED,
+            dense_vram_strategy=VramStrategy.BALANCED,
+            dense_vram_strategy_devices=["cuda:0", "cuda:1"],
+            moe_vram_strategy=VramStrategy.BALANCED,
+            moe_vram_strategy_devices=["cuda:2", "cuda:3"],
         )
 
         payload = cfg.to_dict()
@@ -109,7 +113,10 @@ class TestSerialization(unittest.TestCase):
             "mock_quantization",
             "act_group_aware",
             "hessian",
-            "vram_strategy",
+            "dense_vram_strategy",
+            "dense_vram_strategy_devices",
+            "moe_vram_strategy",
+            "moe_vram_strategy_devices",
         ]
         for field in meta_only_fields:
             self.assertNotIn(field, payload)
@@ -126,7 +133,10 @@ class TestSerialization(unittest.TestCase):
         self.assertEqual(meta["hessian"]["chunk_size"], cfg.hessian.chunk_size)
         self.assertEqual(meta["hessian"]["chunk_bytes"], cfg.hessian.chunk_bytes)
         self.assertEqual(meta["hessian"]["staging_dtype"], "bfloat16")
-        self.assertEqual(meta["vram_strategy"], cfg.vram_strategy.value)
+        self.assertEqual(meta["dense_vram_strategy"], cfg.dense_vram_strategy.value)
+        self.assertEqual(meta["dense_vram_strategy_devices"], cfg.dense_vram_strategy_devices)
+        self.assertEqual(meta["moe_vram_strategy"], cfg.moe_vram_strategy.value)
+        self.assertEqual(meta["moe_vram_strategy_devices"], cfg.moe_vram_strategy_devices)
 
     def test_gptaq_config_none_serialization(self):
         cfg = QuantizeConfig()
@@ -136,3 +146,16 @@ class TestSerialization(unittest.TestCase):
         self.assertIsInstance(meta, dict)
         self.assertIn("gptaq", meta)
         self.assertIsNone(meta["gptaq"])
+
+    def test_awq_scale_search_chunked_activations_roundtrip(self):
+        cfg = AWQConfig(scale_search_chunked_activations=False)
+
+        payload = cfg.to_dict()
+        meta = payload.get("meta")
+        self.assertIsInstance(meta, dict)
+        self.assertIn("scale_search_chunked_activations", meta)
+        self.assertFalse(meta["scale_search_chunked_activations"])
+
+        loaded = QuantizeConfig.from_quant_config(payload)
+        self.assertIsInstance(loaded, AWQConfig)
+        self.assertFalse(loaded.scale_search_chunked_activations)

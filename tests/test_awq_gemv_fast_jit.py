@@ -112,6 +112,7 @@ def test_awq_gemv_fast_decode_normalizes_noncontiguous_inputs_and_buffers(monkey
     module.qzeros = module.qzeros.t().contiguous().t()
 
     monkeypatch.setattr(gemv_fast_awq, "awq_runtime_available", lambda: True)
+    monkeypatch.setattr(gemv_fast_awq.torch.cuda, "get_device_capability", lambda device=None: (8, 9))
 
     def fake_decode(inputs, qweight, scales, zeros, m, n, k, group_size):
         assert inputs.is_contiguous()
@@ -135,6 +136,7 @@ def test_awq_gemv_fast_prefill_normalizes_noncontiguous_inputs(monkeypatch):
     module = _build_module()
 
     monkeypatch.setattr(gemv_fast_awq, "awq_runtime_available", lambda: True)
+    monkeypatch.setattr(gemv_fast_awq.torch.cuda, "get_device_capability", lambda device=None: (8, 9))
     monkeypatch.setattr(gemv_fast_awq, "awq_fast_gemv_forward_decode", lambda *_args, **_kwargs: None)
 
     def fake_prefill(inputs, qweight, scales, zeros):
@@ -158,6 +160,7 @@ def test_llm_awq_decode_normalizes_scaled_zeros_without_dynamic_attr_access(monk
     module.scaled_zeros = module.scaled_zeros.t().contiguous().t()
 
     monkeypatch.setattr(gemv_fast_awq, "awq_runtime_available", lambda: True)
+    monkeypatch.setattr(gemv_fast_awq.torch.cuda, "get_device_capability", lambda device=None: (8, 9))
 
     def fake_decode(inputs, qweight, scales, zeros, m, n, k, group_size):
         assert zeros.is_contiguous()

@@ -27,7 +27,6 @@ from pathlib import Path  # noqa: E402
 from typing import Any, Dict, List, Optional  # noqa: E402
 
 from logbar import LogBar  # noqa: E402
-from tabulate import tabulate  # noqa: E402
 
 
 sys.path.insert(0, f"{str(Path(__file__).resolve().parent.parent)}/models")  # noqa: E402
@@ -149,6 +148,7 @@ from gptqmodel.quantization.config import (  # noqa: E402
     WeightOnlyConfig,
     resolve_quant_format,
 )
+from gptqmodel.utils.logger import render_table  # noqa: E402
 from gptqmodel.utils.model import MODALITY  # noqa: E402
 from gptqmodel.utils.torch import torch_empty_cache  # noqa: E402
 
@@ -165,19 +165,25 @@ DEFAULT_TASK_NAMES = ("arc_challenge",)
 class ModelTest(unittest.TestCase):
     DEBUG = True # enable extra debug output
 
-    VRAM_STRATEGY = VramStrategy.EXCLUSIVE
+    DENSE_VRAM_STRATEGY = VramStrategy.EXCLUSIVE
+    DENSE_VRAM_STRATEGY_DEVICES = None
+    MOE_VRAM_STRATEGY = VramStrategy.EXCLUSIVE
+    MOE_VRAM_STRATEGY_DEVICES = None
     TRUST_REMOTE_CODE = False
     TORCH_DTYPE = "auto"
     EVAL_BATCH_SIZE = "auto"
     QUANT_BATCH_SIZE = 1
     LOAD_BACKEND = BACKEND.MARLIN
     QUANT_BACKEND = BACKEND.AUTO
-    PIN_CUDA_DEVICE: Optional[int] = None
     USE_VLLM = False
     INPUTS_MAX_LENGTH = 2048
     MODEL_MAX_LEN = 4096
     DATASET_SIZE = 512
+    DATASET_SIZE_FAST = None
+    DATASET_SIZE_SLOW = None
     DATASET_CONCAT_SIZE = None
+    DATASET_CONCAT_SIZE_FAST = None
+    DATASET_CONCAT_SIZE_SLOW = None
     DATASET_CONCAT_SEPARATOR = None
     DATASET_SORT = "desc"
     DELETE_QUANTIZED_MODEL = True
@@ -249,6 +255,8 @@ class ModelTest(unittest.TestCase):
     STOP_AFTER_LAYER: Optional[int] = None
     MOE_CONFIG: Optional[MoEConfig] = None
     OFFLOAD_TO_DISK: bool = True
+    OFFLOAD_TO_DISK_FAST = None
+    OFFLOAD_TO_DISK_SLOW = None
 
     GENERIC_TEST_PROMPTS = [
         {"prompt": "Which city is the capital city of France?", "keywords": ["paris"]},
@@ -336,6 +344,14 @@ class ModelTest(unittest.TestCase):
                 return self._resolve_metric_baseline_value(getattr(self, fallback))
 
         return self._resolve_metric_baseline_value(getattr(self, attr_name, None))
+
+    def _mode_specific_test_setting(self, attr_name: str):
+        mode_suffix = "FAST" if self._is_fast_model_test_mode() else "SLOW"
+        preferred = f"{attr_name}_{mode_suffix}"
+        value = getattr(self, preferred, None)
+        if value is not None:
+            return value
+        return getattr(self, attr_name, None)
 
     def _legacy_metric_ceil_pct(self) -> float:
         if self._is_fast_model_test_mode():
@@ -571,13 +587,7 @@ class ModelTest(unittest.TestCase):
         model,
         tokenizer,
         processor,
-        cleanup_callback,
     ):
-        if cleanup_callback is not None:
-            try:
-                cleanup_callback()
-            except Exception:
-                pass
         return model, tokenizer, processor
 
     def _normalize_task_identifier(self, task):
@@ -943,7 +953,7 @@ class ModelTest(unittest.TestCase):
         previous_backend = self.LOAD_BACKEND
         self.LOAD_BACKEND = backend
         try:
-            task_results = self.lm_eval(
+            task_results = self.evaluate_model(
                 model=model,
                 trust_remote_code=self.TRUST_REMOTE_CODE,
                 delete_quantized_model=False,
@@ -1044,12 +1054,24 @@ class ModelTest(unittest.TestCase):
                 and backend != torch_fused_backend
             )
             if use_cuda_map:
-                model = self.loadQuantModel(
-                    model_path,
-                    trust_remote_code=trust_remote_code,
-                    backend=backend,
-                    device_map=self._preferred_cuda_device_map(backend=backend) or {"": "cuda:0"},
-                )
+                try:
+                    model = self.loadQuantModel(
+                        model_path,
+                        trust_remote_code=trust_remote_code,
+                        backend=backend,
+                        device_map={"": "cuda:0"},
+                    )
+                except torch.OutOfMemoryError:
+                    log.warn(
+                        "Post-quant load with device_map={'': 'cuda:0'} OOMed for backend `%s`; retrying with loader defaults.",
+                        backend.name,
+                    )
+                    torch_empty_cache()
+                    model = self.loadQuantModel(
+                        model_path,
+                        trust_remote_code=trust_remote_code,
+                        backend=backend,
+                    )
             else:
                 model = self.loadQuantModel(
                     model_path,
@@ -1057,8 +1079,8 @@ class ModelTest(unittest.TestCase):
                     backend=backend,
             )
             model.tokenizer or self.load_tokenizer(model_path, trust_remote_code=trust_remote_code)
-            # Pre-lm-eval smoke prompts are intentionally disabled to keep quantization tests
-            # focused only on lm_eval task execution.
+            # Pre-evaluation smoke prompts are intentionally disabled to keep quantization tests
+            # focused only on task execution.
             # inference_records[backend] = self.run_generic_inference_checks(model, tokenizer, backend)
 
             should_reuse = can_reuse and backend == target_backend and not self.USE_VLLM
@@ -1151,17 +1173,6 @@ class ModelTest(unittest.TestCase):
             print(f"\n{colorize(f'Index file: {rel_name}', 0, False)}")
             print(json.dumps(content, indent=2, sort_keys=True))
 
-    def _prepare_quant_save_destination(self, need_eval):
-        if self.SAVE_PATH:
-            return contextlib.nullcontext(self.SAVE_PATH), self.SAVE_PATH, None
-
-        if need_eval:
-            tmp_dir = tempfile.mkdtemp()
-            return contextlib.nullcontext(tmp_dir), tmp_dir, lambda: shutil.rmtree(tmp_dir, ignore_errors=True)
-
-        tmp_context = tempfile.TemporaryDirectory()
-        return tmp_context, tmp_context.name, tmp_context.cleanup
-
     def _resolve_quantized_model_path(self, model_candidate):
         if model_candidate is None:
             return None
@@ -1174,6 +1185,23 @@ class ModelTest(unittest.TestCase):
     def _cleanup_quantized_model(self, model_candidate, enabled=True):
         if not enabled:
             return False
+
+        temp_dir_context = getattr(model_candidate, "_temp_dir_context", None)
+        if temp_dir_context is not None:
+            try:
+                temp_dir_context.cleanup()
+            except OSError as exc:
+                log.warn(f"Failed to delete temp model `{temp_dir_context.name}`: {exc}")
+                return False
+
+            try:
+                delattr(model_candidate, "_temp_dir_context")
+            except AttributeError:
+                pass
+
+            log.info(f"Deleting temp model: {temp_dir_context.name}")
+            return True
+
         target_path = self._resolve_quantized_model_path(model_candidate)
         if not target_path or not isinstance(target_path, str):
             return False
@@ -1298,7 +1326,10 @@ class ModelTest(unittest.TestCase):
             table_rows.append(row)
 
         headers = ["Metric"] + [backend.name for backend in ordered_backends]
-        log.info("Evaluation comparison:\n%s", tabulate(table_rows, headers=headers, tablefmt="github"))
+        log.info(
+            "Evaluation comparison:\n%s",
+            render_table(table_rows, headers=headers, tablefmt="github"),
+        )
 
     @classmethod
     def load_tokenizer(cls, model_id_or_path, trust_remote_code=False):
@@ -1399,7 +1430,10 @@ class ModelTest(unittest.TestCase):
                     block_size=self.BNB_BLOCK_SIZE,
                     compress_statistics=self.BNB_COMPRESS_STATISTICS,
                     adapter=self.EORA,
-                    vram_strategy=self.VRAM_STRATEGY,
+                    dense_vram_strategy=self.DENSE_VRAM_STRATEGY,
+                    dense_vram_strategy_devices=self.DENSE_VRAM_STRATEGY_DEVICES,
+                    moe_vram_strategy=self.MOE_VRAM_STRATEGY,
+                    moe_vram_strategy_devices=self.MOE_VRAM_STRATEGY_DEVICES,
                     dynamic=self.DYNAMIC,
                     moe=self.MOE_CONFIG,
                     offload_to_disk=self.OFFLOAD_TO_DISK,
@@ -1413,7 +1447,10 @@ class ModelTest(unittest.TestCase):
                     opt_finetune_epochs=self.PAROQUANT_FINETUNE_EPOCHS,
                     opt_train_samples=self.PAROQUANT_TRAIN_SAMPLES,
                     adapter=self.EORA,
-                    vram_strategy=self.VRAM_STRATEGY,
+                    dense_vram_strategy=self.DENSE_VRAM_STRATEGY,
+                    dense_vram_strategy_devices=self.DENSE_VRAM_STRATEGY_DEVICES,
+                    moe_vram_strategy=self.MOE_VRAM_STRATEGY,
+                    moe_vram_strategy_devices=self.MOE_VRAM_STRATEGY_DEVICES,
                     dynamic=self.DYNAMIC,
                     moe=self.MOE_CONFIG,
                     offload_to_disk=self.OFFLOAD_TO_DISK,
@@ -1428,7 +1465,10 @@ class ModelTest(unittest.TestCase):
                     bits=self.BITS,
                     adapter=self.EORA,
                     pack_impl="cpu",
-                    vram_strategy=self.VRAM_STRATEGY,
+                    dense_vram_strategy=self.DENSE_VRAM_STRATEGY,
+                    dense_vram_strategy_devices=self.DENSE_VRAM_STRATEGY_DEVICES,
+                    moe_vram_strategy=self.MOE_VRAM_STRATEGY,
+                    moe_vram_strategy_devices=self.MOE_VRAM_STRATEGY_DEVICES,
                     dynamic=self.DYNAMIC,
                     moe=self.MOE_CONFIG,
                     smoother=self.WEIGHT_ONLY.smooth,
@@ -1440,7 +1480,10 @@ class ModelTest(unittest.TestCase):
                     format=self.FORMAT,
                     adapter=self.EORA,
                     pack_impl="cpu",
-                    vram_strategy=self.VRAM_STRATEGY,
+                    dense_vram_strategy=self.DENSE_VRAM_STRATEGY,
+                    dense_vram_strategy_devices=self.DENSE_VRAM_STRATEGY_DEVICES,
+                    moe_vram_strategy=self.MOE_VRAM_STRATEGY,
+                    moe_vram_strategy_devices=self.MOE_VRAM_STRATEGY_DEVICES,
                     dynamic=self.DYNAMIC,
                     moe=self.MOE_CONFIG,
                     smoother=self.WEIGHT_ONLY.smooth,
@@ -1454,7 +1497,10 @@ class ModelTest(unittest.TestCase):
                 format=self.FORMAT,
                 adapter=self.EORA,
                 pack_impl="cpu",
-                vram_strategy=self.VRAM_STRATEGY,
+                dense_vram_strategy=self.DENSE_VRAM_STRATEGY,
+                dense_vram_strategy_devices=self.DENSE_VRAM_STRATEGY_DEVICES,
+                moe_vram_strategy=self.MOE_VRAM_STRATEGY,
+                moe_vram_strategy_devices=self.MOE_VRAM_STRATEGY_DEVICES,
                 dynamic=self.DYNAMIC,
                 moe=self.MOE_CONFIG,
                 smooth=self.WEIGHT_ONLY.smooth,
@@ -1473,32 +1519,17 @@ class ModelTest(unittest.TestCase):
             foem=copy.deepcopy(self.FOEM),
             adapter=self.EORA,
             pack_impl="cpu",
-            vram_strategy=self.VRAM_STRATEGY,
+            dense_vram_strategy=self.DENSE_VRAM_STRATEGY,
+            dense_vram_strategy_devices=self.DENSE_VRAM_STRATEGY_DEVICES,
+            moe_vram_strategy=self.MOE_VRAM_STRATEGY,
+            moe_vram_strategy_devices=self.MOE_VRAM_STRATEGY_DEVICES,
             damp_percent=self.DAMP_PERCENT,
             mse=self.MSE,
             dynamic=self.DYNAMIC,
             hessian=HessianConfig(chunk_size=self.HESSIAN_CHUNK_SIZE),
             moe=self.MOE_CONFIG,
-            offload_to_disk=self.OFFLOAD_TO_DISK,
+            offload_to_disk=self._mode_specific_test_setting("OFFLOAD_TO_DISK"),
         )
-
-    def _preferred_cuda_device_map(self, *, backend=None):
-        if self.PIN_CUDA_DEVICE is None or not torch.cuda.is_available():
-            return None
-
-        active_backend = backend if backend is not None else self._current_load_backend()
-        if active_backend == self._torch_fused_backend():
-            return None
-
-        try:
-            if self.PIN_CUDA_DEVICE >= torch.cuda.device_count():
-                self.skipTest(
-                    f"CUDA device {self.PIN_CUDA_DEVICE} requested but only {torch.cuda.device_count()} visible device(s) are available."
-                )
-        except Exception:
-            pass
-
-        return {"": f"cuda:{self.PIN_CUDA_DEVICE}"}
 
     def quantModel(self, model_id_or_path, trust_remote_code=False, dtype="auto", need_eval=True, batch_size: int = QUANT_BATCH_SIZE, call_perform_post_quant_validation: bool = True, **kwargs):
         """Return `(model, tokenizer, processor)`; `processor` is `None` for text-only models."""
@@ -1528,7 +1559,7 @@ class ModelTest(unittest.TestCase):
             device_map=(
                 {"": "cpu"}
                 if self.LOAD_BACKEND == torch_fused_backend
-                else (self._preferred_cuda_device_map(backend=self.LOAD_BACKEND) or "auto")
+                else "auto"
             ),
             **args,
         )
@@ -1549,9 +1580,21 @@ class ModelTest(unittest.TestCase):
 
         self._apply_model_compat_quant_overrides(model)
 
+        dataset_size = self._mode_specific_test_setting("DATASET_SIZE")
+        dataset_concat_size = self._mode_specific_test_setting("DATASET_CONCAT_SIZE")
+        log.info(
+            "Calibration dataset config: size=%s, concat_size=%s",
+            dataset_size,
+            dataset_concat_size,
+        )
+
         is_image_to_text_model = MODALITY.IMAGE_TO_TEXT in model.modality
         if quantize_config.requires_calibration_dataset():
-            calibration_dataset = get_calib_dataset(model) if is_image_to_text_model else self.load_dataset(tokenizer, self.DATASET_SIZE)
+            calibration_dataset = (
+                get_calib_dataset(model)
+                if is_image_to_text_model
+                else self.load_dataset(tokenizer, dataset_size)
+            )
         else:
             calibration_dataset = None
 
@@ -1569,13 +1612,11 @@ class ModelTest(unittest.TestCase):
         need_create_processor = is_image_to_text_model and not is_ovis_model
 
         if not is_quantized:
-            cleanup_callback = None
+            temp_dir_context = None
             try:
-                save_context, planned_save_path, cleanup_callback = self._prepare_quant_save_destination(need_eval)
-                log.info(f"Quantized model artifacts will be saved to: {planned_save_path}")
                 model.quantize(
                     calibration_dataset,
-                    calibration_concat_size=self.DATASET_CONCAT_SIZE,
+                    calibration_concat_size=dataset_concat_size,
                     calibration_concat_separator=self.DATASET_CONCAT_SEPARATOR,
                     calibration_sort=self.DATASET_SORT,
                     backend=self.QUANT_BACKEND,
@@ -1594,12 +1635,23 @@ class ModelTest(unittest.TestCase):
                         model=model,
                         tokenizer=tokenizer,
                         processor=None,
-                        cleanup_callback=cleanup_callback,
                     )
+
+                if self.SAVE_PATH:
+                    planned_save_path = self.SAVE_PATH
+                    save_context = contextlib.nullcontext(planned_save_path)
+                elif need_eval:
+                    temp_dir_context = tempfile.TemporaryDirectory()
+                    planned_save_path = temp_dir_context.name
+                    save_context = contextlib.nullcontext(planned_save_path)
+                else:
+                    save_context = tempfile.TemporaryDirectory()
+                    planned_save_path = save_context.name
+
+                log.info(f"Quantized model artifacts will be saved to: {planned_save_path}")
 
                 # TODO: make into shared method
                 with save_context as path:
-                    cleanup_callback = None
                     os.makedirs(path, exist_ok=True)
                     self.clear_directory(path)
 
@@ -1627,7 +1679,7 @@ class ModelTest(unittest.TestCase):
                                 path,
                                 trust_remote_code=trust_remote_code,
                                 backend=target_backend,
-                                device_map=self._preferred_cuda_device_map(backend=target_backend) or {"": "cuda:0"},
+                                device_map={"": "cuda:0"},
                             )
                         else:
                             q_model = self.loadQuantModel(path, trust_remote_code=trust_remote_code, backend=target_backend)
@@ -1637,10 +1689,13 @@ class ModelTest(unittest.TestCase):
                     q_tokenizer = q_model.tokenizer or self.load_tokenizer(path, trust_remote_code=trust_remote_code)
                     if need_create_processor:
                         processor = AutoProcessor.from_pretrained(path, trust_remote_code=trust_remote_code)
+                    if temp_dir_context is not None:
+                        setattr(q_model, "_temp_dir_context", temp_dir_context)
+                        temp_dir_context = None
             except Exception:
-                if cleanup_callback is not None:
+                if temp_dir_context is not None:
                     try:
-                        cleanup_callback()
+                        temp_dir_context.cleanup()
                     except Exception:
                         pass
                 raise
@@ -1677,7 +1732,7 @@ class ModelTest(unittest.TestCase):
         explicit_device = "device" in load_kwargs
         inserted_device_map = False
         if "device_map" not in load_kwargs and not explicit_device:
-            load_kwargs["device_map"] = self._preferred_cuda_device_map(backend=active_backend) or default_device_map
+            load_kwargs["device_map"] = default_device_map
             inserted_device_map = True
 
         # Post-quant CI runs may expose multiple GPUs; pin loading to the first one to avoid spread-out auto maps.
@@ -1696,7 +1751,7 @@ class ModelTest(unittest.TestCase):
 
             if multi_device:
                 if self.EVAL_SINGLE_GPU:
-                    load_kwargs["device_map"] = self._preferred_cuda_device_map(backend=active_backend) or {"": "cuda:0"}
+                    load_kwargs["device_map"] = {"": "cuda:0"}
 
         model = GPTQModel.load(
             model_id_or_path,
@@ -1708,7 +1763,7 @@ class ModelTest(unittest.TestCase):
 
         return model
 
-    def lm_eval(self, model, trust_remote_code=False, delete_quantized_model=False, extra_args:dict=None):
+    def evaluate_model(self, model, trust_remote_code=False, delete_quantized_model=False, extra_args:dict=None):
         try:
             task_names = self._normalize_task_list()
             aggregated_results = {}
@@ -1800,7 +1855,7 @@ class ModelTest(unittest.TestCase):
                 print(f"batch {old_batch} OOM, retrying with batch {self.EVAL_BATCH_SIZE}")
 
                 if int(self.EVAL_BATCH_SIZE) > 0:
-                    results = self.lm_eval(model=model,
+                    results = self.evaluate_model(model=model,
                                            trust_remote_code=trust_remote_code,
                                            delete_quantized_model=delete_quantized_model,
                                            extra_args=extra_args)
@@ -1845,7 +1900,7 @@ class ModelTest(unittest.TestCase):
                 "Baseline fallback: evaluating current native model `%s` to verify whether stored expectations are stale.",
                 native_model_id,
             )
-            cached = self.lm_eval(
+            cached = self.evaluate_model(
                 model=native_model_id,
                 trust_remote_code=self.TRUST_REMOTE_CODE,
                 delete_quantized_model=False,
@@ -1903,7 +1958,7 @@ class ModelTest(unittest.TestCase):
         )
         return True
 
-    def quant_lm_eval(self):
+    def quantize_and_evaluate(self):
         self.model = None
         # TODO fix me: LOAD_QUANTIZED_MODEL doesn't make any sense when we have QUANT_SAVE_PATH
         #if self.QUANT_SAVE_PATH:
@@ -1917,13 +1972,13 @@ class ModelTest(unittest.TestCase):
         self.check_kernel(self.model, self.KERNEL_INFERENCE)
 
         if self._debug_layer_stop_triggered():
-            log.info("DEBUG mode: skipping lm_eval and baseline checks after early layer stop.")
+            log.info("DEBUG mode: skipping evaluation and baseline checks after early layer stop.")
             return
 
         eval_records = getattr(self, "_post_quant_eval_records", {})
         target_backend = self._current_load_backend()
         if eval_records and len(eval_records) == 1 and target_backend in eval_records:
-            log.info("Reusing evaluation results for backend `%s`; skipping duplicate lm_eval run", target_backend.name)
+            log.info("Reusing evaluation results for backend `%s`; skipping duplicate evaluation run", target_backend.name)
             task_results = eval_records[target_backend]
         else:
             task_results = eval_records.get(target_backend)
@@ -1934,7 +1989,7 @@ class ModelTest(unittest.TestCase):
                         target_backend.name,
                     )
                     with self.model_compat_test_context():
-                        task_results = self.lm_eval(
+                        task_results = self.evaluate_model(
                             model=self.SAVE_PATH if self.SAVE_PATH else self.model,
                             trust_remote_code=self.TRUST_REMOTE_CODE,
                             delete_quantized_model=False,
@@ -1943,7 +1998,7 @@ class ModelTest(unittest.TestCase):
                 else:
                     raise AssertionError(
                         "Post-quant eval results were not produced. "
-                        "The Stage-2 lm_eval fallback is disabled."
+                        "The Stage-2 evaluation fallback is disabled."
                     )
         self.check_results(task_results)
         self._cleanup_quantized_model(self.model, enabled=self.DELETE_QUANTIZED_MODEL)

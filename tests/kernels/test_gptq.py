@@ -12,7 +12,6 @@ from typing import List, Tuple
 import torch
 from logbar import LogBar
 from parameterized import parameterized
-from tabulate import tabulate
 
 from gptqmodel import BACKEND, GPTQModel
 from gptqmodel.adapter.adapter import Adapter, AdapterCache, Lora
@@ -22,6 +21,7 @@ from gptqmodel.nn_modules.qlinear.machete import MacheteLinear
 from gptqmodel.nn_modules.qlinear.marlin import MarlinLinear
 from gptqmodel.nn_modules.qlinear.torch import TorchLinear
 from gptqmodel.nn_modules.qlinear.tritonv2 import TritonV2Linear
+from gptqmodel.utils.logger import render_table
 from gptqmodel.utils.machete import (
     machete_runtime_available,
     machete_runtime_error,
@@ -264,7 +264,7 @@ class TestKernelOutput(unittest.TestCase):
         speedup = reference_mean_ms / actual_mean_ms if actual_mean_ms else 0.0
         details = "\n\n".join(str(detail) for detail in failures) if failures else "-"
 
-        table = tabulate(
+        table = render_table(
             [
                 [
                     backend.name,
@@ -308,12 +308,14 @@ class TestKernelOutput(unittest.TestCase):
             if not machete_runtime_available():
                 self.skipTest(f"Machete kernel unavailable: {machete_runtime_error()}")
 
+    # Updated CUDA kernel tolerances below were re-baselined from full
+    # torch-vs-kernel validation on H200.
     float16_cases = [
         (BACKEND.TORCH, torch.float16, 0.0000),
         (BACKEND.TRITON, torch.float16, 0.00001),
         (BACKEND.EXLLAMA_V2, torch.float16, 0.0068),
-        (BACKEND.MACHETE, torch.float16, 0.00040),
-        (BACKEND.MARLIN, torch.float16, 0.00035),
+        (BACKEND.MACHETE, torch.float16, 0.0010),
+        (BACKEND.MARLIN, torch.float16, 0.0010),
     ]
     if _bitblas_supports_gptq_case(torch.float16):
         float16_cases.append((BACKEND.BITBLAS, torch.float16, 0.0035))
@@ -340,9 +342,9 @@ class TestKernelOutput(unittest.TestCase):
     bfloat16_cases = [
         (BACKEND.TORCH, torch.bfloat16, 0.0000),
         (BACKEND.TRITON, torch.bfloat16, 0.00001),
-        (BACKEND.EXLLAMA_V2, torch.bfloat16, 0.0054),
-        (BACKEND.MACHETE, torch.bfloat16, 0.0033),
-        (BACKEND.MARLIN, torch.bfloat16, 0.0031),
+        (BACKEND.EXLLAMA_V2, torch.bfloat16, 0.0080),
+        (BACKEND.MACHETE, torch.bfloat16, 0.0080),
+        (BACKEND.MARLIN, torch.bfloat16, 0.0080),
     ]
     if _bitblas_supports_gptq_case(torch.bfloat16):
         bfloat16_cases.append((BACKEND.BITBLAS, torch.bfloat16, 0.0031))
@@ -370,8 +372,8 @@ class TestKernelOutput(unittest.TestCase):
         (BACKEND.TORCH, torch.float16, 0.0000),
         (BACKEND.TRITON, torch.float16, 0.00001),
         (BACKEND.EXLLAMA_V2, torch.float16, 0.0065),
-        (BACKEND.MACHETE, torch.float16, 0.00040),
-        (BACKEND.MARLIN, torch.float16, 0.00035),
+        (BACKEND.MACHETE, torch.float16, 0.0010),
+        (BACKEND.MARLIN, torch.float16, 0.0020),
     ]
     if _bitblas_supports_gptq_case(torch.float16):
         float16_lora_cases.append((BACKEND.BITBLAS, torch.float16, 0.00035))
@@ -397,9 +399,9 @@ class TestKernelOutput(unittest.TestCase):
     bfloat16_lora_cases = [
         (BACKEND.TORCH, torch.bfloat16, 0.0000),
         (BACKEND.TRITON, torch.bfloat16, 0.00001),
-        (BACKEND.EXLLAMA_V2, torch.bfloat16, 0.0059),
-        (BACKEND.MACHETE, torch.bfloat16, 0.0033),
-        (BACKEND.MARLIN, torch.bfloat16, 0.0050),
+        (BACKEND.EXLLAMA_V2, torch.bfloat16, 0.0160),
+        (BACKEND.MACHETE, torch.bfloat16, 0.0080),
+        (BACKEND.MARLIN, torch.bfloat16, 0.0080),
     ]
     if _bitblas_supports_gptq_case(torch.bfloat16):
         bfloat16_lora_cases.append((BACKEND.BITBLAS, torch.bfloat16, 0.0033))

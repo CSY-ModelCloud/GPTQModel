@@ -16,7 +16,13 @@ import numpy as np
 import torch
 import transformers
 from accelerate import init_empty_weights
-from transformers import AutoConfig, AutoModelForCausalLM, GenerationConfig, PreTrainedModel
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    GenerationConfig,
+    PreTrainedConfig,
+    PreTrainedModel,
+)
 
 from ..nn_modules.qlinear.gguf import (
     PRISM_Q1_0_G128_BLOCK_SIZE,
@@ -26,8 +32,7 @@ from ..nn_modules.qlinear.gguf import (
     _dequantize_prism_q1_0_g128,
     _is_prism_q1_0_g128,
 )
-from ..utils import _MONKEY_PATCH_LOCK
-from ..utils import internal_gguf
+from ..utils import _MONKEY_PATCH_LOCK, internal_gguf
 
 
 # Compatibility wrapper for no_init_weights across different transformers versions
@@ -534,7 +539,16 @@ def _resolve_legacy_tied_weights_mapping(model: PreTrainedModel, tied_mapping) -
 # save/load code stops crashing on older trust_remote_code models that still use
 # the pre-5.x list format.
 def _normalize_legacy_tied_weights_keys(model: PreTrainedModel) -> None:
-    for _name, submodule in model.named_modules(remove_duplicate=False):
+    named_modules = getattr(model, "named_modules", None)
+    if not callable(named_modules):
+        return
+
+    try:
+        modules_iter = named_modules(remove_duplicate=False)
+    except TypeError:
+        modules_iter = named_modules()
+
+    for _name, submodule in modules_iter:
         tied_mapping = getattr(submodule, "_tied_weights_keys", None)
         if not isinstance(tied_mapping, (list, tuple, set)):
             continue
@@ -568,6 +582,11 @@ def _patch_transformers_remote_code_compat() -> None:
     except Exception:
         utils = None
 
+    try:
+        import transformers.modeling_rope_utils as rope_utils
+    except Exception:
+        rope_utils = None
+
     import transformers.utils.generic as generic
     with _MONKEY_PATCH_LOCK:
         if not hasattr(import_utils, "is_torch_fx_available"):
@@ -590,6 +609,51 @@ def _patch_transformers_remote_code_compat() -> None:
                     return bool(legacy_flash_attn_probe("2.1.0"))
 
                 utils.is_flash_attn_greater_or_equal_2_10 = is_flash_attn_greater_or_equal_2_10
+
+        if rope_utils is not None and "default" not in getattr(rope_utils, "ROPE_INIT_FUNCTIONS", {}):
+            # transformers 5.x removed the legacy `"default"` RoPE entrypoint,
+            # but older trust_remote_code model files still resolve it directly.
+            # Recreate the unscaled/base initializer instead of aliasing to
+            # `"linear"` so configs do not need an artificial `factor=1.0`.
+            def _compute_default_rope_parameters_compat(
+                config: Optional["PreTrainedConfig"] = None,
+                device: Optional["torch.device"] = None,
+                seq_len: int | None = None,
+                layer_type: str | None = None,
+            ) -> tuple["torch.Tensor", float]:
+                del seq_len
+                if config is None:
+                    raise ValueError("`config` is required to compute default RoPE parameters.")
+
+                standardize_rope_params = getattr(config, "standardize_rope_params", None)
+                if callable(standardize_rope_params):
+                    standardize_rope_params()
+
+                rope_parameters = getattr(config, "rope_parameters", None)
+                if layer_type is not None and isinstance(rope_parameters, dict):
+                    rope_parameters = rope_parameters.get(layer_type, rope_parameters)
+
+                rope_theta = None
+                partial_rotary_factor = 1.0
+                if isinstance(rope_parameters, dict):
+                    rope_theta = rope_parameters.get("rope_theta")
+                    partial_rotary_factor = rope_parameters.get("partial_rotary_factor", partial_rotary_factor)
+
+                if rope_theta is None:
+                    rope_theta = getattr(config, "rope_theta", None)
+                    if rope_theta is None:
+                        rope_theta = getattr(config, "default_theta", 10_000.0)
+
+                head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+                dim = int(head_dim * partial_rotary_factor)
+                attention_factor = 1.0
+                inv_freq = 1.0 / (
+                    rope_theta
+                    ** (torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float) / dim)
+                )
+                return inv_freq, attention_factor
+
+            rope_utils.ROPE_INIT_FUNCTIONS["default"] = _compute_default_rope_parameters_compat
 
         if cache_utils is not None and not hasattr(cache_utils, "SlidingWindowCache") and hasattr(cache_utils, "StaticCache"):
             # transformers 5.x folds sliding-window behavior into StaticCache
@@ -927,7 +991,7 @@ def _normalize_remote_code_config_compat(config: Any) -> None:
     if not isinstance(rope_scaling, dict):
         return
 
-    if rope_scaling.get("rope_type") == "default" and set(rope_scaling).issubset({"rope_type", "rope_theta"}):
+    if model_type != "instella" and rope_scaling.get("rope_type") == "default" and set(rope_scaling).issubset({"rope_type", "rope_theta"}):
         # transformers 5.x materializes default RoPE metadata into
         # `rope_scaling`, but older remote MiniCPM code treats any dict here
         # as a scaled-RoPE config and expects an explicit `factor`.
@@ -942,6 +1006,10 @@ def _normalize_remote_code_config_compat(config: Any) -> None:
         return
 
     rope_scaling = dict(rope_scaling)
+    if model_type == "instella":
+        if rope_type == "default":
+            rope_type = "linear"
+        rope_scaling["factor"] = 1.0
     rope_scaling["type"] = rope_type
     config.rope_scaling = rope_scaling
 
@@ -1016,15 +1084,8 @@ def prepare_remote_model_init_compat(model_id_or_path: Optional[str], config: An
     input_mode_enum = getattr(remote_module, "InputMode", None) if remote_module is not None else None
 
     with _MONKEY_PATCH_LOCK:
-        if config.model_type == "minicpm":
+        if outer_model_cls is not None:
             try_patch_legacy_flash_attn_flag(outer_model_cls)
-            base_model_cls = getattr(
-                remote_module,
-                "MiniCPMModel",
-                None,
-            )
-            if base_model_cls:
-                try_patch_legacy_flash_attn_flag(base_model_cls)
 
         if config.model_type == "minicpmv" or config.model_type == "minicpmo":
             vision_model_cls = getattr(
@@ -1204,15 +1265,29 @@ def prepare_remote_model_init_compat(model_id_or_path: Optional[str], config: An
 
 def try_patch_legacy_flash_attn_flag(model_cls):
     with _MONKEY_PATCH_LOCK:
-        if (
-                model_cls is not None
-                and getattr(model_cls, "_supports_flash_attn_2", None) is not None
-                and not bool(getattr(model_cls, "_supports_flash_attn", False))
-        ):
-            # transformers 5.x checks `_supports_flash_attn`, while older
-            # trust_remote_code classes such as MiniCPM still expose only the
-            # legacy `_supports_flash_attn_2` capability flag.
-            model_cls._supports_flash_attn = bool(getattr(model_cls, "_supports_flash_attn_2"))
+        if model_cls is None or not isinstance(model_cls, type):
+            return
+
+        # Find the most specific class that explicitly declares the newer
+        # `_supports_flash_attn_2` flag used by newer transformers releases.
+        base_with_flag = None
+        for cls in model_cls.__mro__:
+            if "_supports_flash_attn_2" in cls.__dict__:
+                base_with_flag = cls
+                break
+
+        if base_with_flag is None:
+            return
+
+        # Respect remote models that already define the legacy flag themselves.
+        for cls in model_cls.__mro__:
+            if cls is base_with_flag:
+                break
+            if "_supports_flash_attn" in cls.__dict__:
+                return
+
+        flash_attn_2_val = base_with_flag.__dict__["_supports_flash_attn_2"]
+        setattr(base_with_flag, "_supports_flash_attn", bool(flash_attn_2_val))
 
 
 def load_tokenizer(tokenizer_or_path, *, model_config: Any = None, **kwargs):

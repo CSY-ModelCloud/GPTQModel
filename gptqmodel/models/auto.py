@@ -68,7 +68,7 @@ from ..utils.hf import (  # noqa: E402
 )
 from ..utils.hub import list_repo_files  # noqa: E402
 from ..utils.model import find_modules  # noqa: E402
-from ..utils.torch import CPU, torch_empty_cache  # noqa: E402
+from ..utils.torch import torch_empty_cache  # noqa: E402
 from .base import BaseQModel  # noqa: E402
 from .definitions.afmoe import AfMoeQModel  # noqa: E402
 from .definitions.apertus import ApertusQModel  # noqa: E402
@@ -90,10 +90,14 @@ from .definitions.ernie4_5_moe import Ernie4_5_MoeQModel  # noqa: E402
 from .definitions.exaone import ExaOneQModel  # noqa: E402
 from .definitions.exaone4 import Exaone4QModel  # noqa: E402
 from .definitions.falcon_h1 import FalconH1QModel  # noqa: E402
+from .definitions.falcon_mamba import FalconMambaQModel  # noqa: E402
 from .definitions.gemma2 import Gemma2QModel  # noqa: E402
 from .definitions.gemma3 import Gemma3ForConditionalGenerationGPTQ, Gemma3QModel  # noqa: E402
+from .definitions.gemma3n import Gemma3nForConditionalGenerationGPTQ, Gemma3nTextQModel  # noqa: E402
 from .definitions.gemma4 import Gemma4ForConditionalGenerationGPTQ, Gemma4TextQModel  # noqa: E402
 from .definitions.glm import GlmQModel  # noqa: E402
+from .definitions.glmasr import GlmASRGPTQ  # noqa: E402
+from .definitions.glm_ocr import GlmOCRGPTQ  # noqa: E402
 from .definitions.glm4_moe import GLM4MoEGPTQ  # noqa: E402
 from .definitions.glm4_moe_lite import Glm4MoeLiteQModel  # noqa: E402
 from .definitions.glm4v import Glm4vGPTQ  # noqa: E402
@@ -183,6 +187,8 @@ MODEL_MAP = {
     "glm": GlmQModel,
     "glm4": GlmQModel,
     "glm4v": Glm4vGPTQ,
+    "glmasr": GlmASRGPTQ,
+    "glm_ocr": GlmOCRGPTQ,
     "glm4_moe": GLM4MoEGPTQ,
     "glm4_moe_lite": Glm4MoeLiteQModel,
     "glm_moe_dsa": GlmMoeDsaQModel,
@@ -193,6 +199,7 @@ MODEL_MAP = {
     "refinedWebModel": RwgQModel,
     "refinedWeb": RwgQModel,
     "falcon": RwgQModel,
+    "falcon_mamba": FalconMambaQModel,
     "baichuan": BaiChuanQModel,
     "internlm": InternLMQModel,
     "internlm2": InternLM2QModel,
@@ -213,6 +220,8 @@ MODEL_MAP = {
     "gemma2": Gemma2QModel,
     "gemma3_text": Gemma3QModel,
     "gemma3": Gemma3ForConditionalGenerationGPTQ,
+    "gemma3n_text": Gemma3nTextQModel,
+    "gemma3n": Gemma3nForConditionalGenerationGPTQ,
     "gemma4_text": Gemma4TextQModel,
     "gemma4": Gemma4ForConditionalGenerationGPTQ,
     "phi": PhiQModel,
@@ -357,7 +366,7 @@ def _is_supported_quantization_config(config: AutoConfig) -> bool:
 
 
 @contextmanager
-def _hide_unsupported_quantization_config_for_lm_eval(model):
+def _hide_unsupported_quantization_config_for_eval(model):
     config = getattr(model, "config", None)
     if config is None:
         yield
@@ -383,6 +392,12 @@ def _hide_unsupported_quantization_config_for_lm_eval(model):
         yield
     finally:
         setattr(config, "quantization_config", quantization_config)
+
+
+@contextmanager
+def _hide_unsupported_quantization_config_for_lm_eval(model):
+    with _hide_unsupported_quantization_config_for_eval(model):
+        yield
 
 
 def _get_config_load_kwargs(kwargs: dict) -> dict:
@@ -680,6 +695,7 @@ class GPTQModel:
             # pass-through vars for load()
             trust_remote_code: bool = False,
             dtype: Optional[Union[str, torch.dtype]] = None,
+            device: Optional[Union[str, torch.device]] = None,
         ):
             if not adapter or not isinstance(adapter, Lora):
                 raise ValueError(f"Adapter: expected `adapter` type to be `Lora`: actual = `{adapter}`.")
@@ -690,7 +706,7 @@ class GPTQModel:
             quantized_model = GPTQModel.load(
                 model_id_or_path=quantized_model_id_or_path,
                 backend=BACKEND.GPTQ_TORCH,
-                device=CPU,
+                device=device,
                 trust_remote_code=trust_remote_code,
                 dtype=dtype,
             )
@@ -709,7 +725,7 @@ class GPTQModel:
                 backend=BACKEND.GPTQ_TORCH,
                 trust_remote_code=trust_remote_code,
                 dtype=dtype,
-                device=CPU,
+                device=device,
             )
 
             log.info("Model: Adapter generation started")

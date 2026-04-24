@@ -25,7 +25,7 @@ class TestQwen3Next(ModelTest):
     }
     EVAL_TASKS_FAST = ModelTest.derive_fast_eval_tasks(EVAL_TASKS_SLOW)
 
-    VRAM_STRATEGY = VramStrategy.BALANCED
+    DENSE_VRAM_STRATEGY = VramStrategy.BALANCED
     # DATASET_SIZE = 2048
     # TRUST_REMOTE_CODE = True
     # APPLY_CHAT_TEMPLATE = True
@@ -42,4 +42,4 @@ class TestQwen3Next(ModelTest):
     # USE_FLASH_ATTN = True
 
     def test_mimo(self):
-        self.quant_lm_eval()
+        self.quantize_and_evaluate()

@@ -1,7 +1,6 @@
 common:
   - tokenicer
   - transformers
-  - tabulate
   - swig # for models/tests
 
 tests:
@@ -53,7 +52,25 @@ tests:
     - https://github.com/huggingface/transformers
     - https://github.com/huggingface/optimum
 
-  test_awq.py:
+  test_awq_gemm.py:
+    - peft
+
+  test_awq_marlin.py:
+    - peft
+
+  test_awq_gemv.py:
+    - peft
+
+  test_awq_gemv_fast.py:
+    - peft
+
+  test_awq_llm_awq.py:
+    - peft
+
+  test_awq_inference_mistral.py:
+    - peft
+
+  test_awq_inference_llm_awq.py:
     - peft
 
   test_asym_gptq_v1.py:
@@ -77,9 +94,6 @@ tests:
   test_evalplus.py:
     - http://10.0.13.31/files/evalplus-0.4.0.dev44-py3-none-any.whl
 
-  test_lm_eval.py:
-    - peft
-
   test_nemotron_ultra.py:
     - http://10.0.13.31/files/causal_conv1d-1.6.0-cp313-cp313-linux_x86_64.whl
 
@@ -93,6 +107,9 @@ tests:
     - gguf
 
 tests/models:
+  test_chatglm:
+    - sentencepiece
+
   test_cohere2:
     - jieba
 
@@ -108,6 +125,8 @@ tests/models:
   test_hymba.py:
     - http://10.0.13.31/files/causal_conv1d-1.6.0-cp313-cp313-linux_x86_64.whl
     - mamba_ssm
+    - tiktoken
+    - attn_gym
 
   test_internlm.py:
     - transformers<=4.44.2
@@ -117,3 +136,16 @@ tests/models:
 
   test_phi_3_moe.py:
     - transformers<=4.44.2
+
+  test_phi_4.py:
+    - backoff>=2.2.1
+    - optimum>=1.24.0
+    - scipy
+    - backoff
+
+  test_llama3_2_exllamav3.py:
+    - pydantic
+
+tests/models/awq:
+  test_qwen3_8b_base_awq.py:
+    - peft

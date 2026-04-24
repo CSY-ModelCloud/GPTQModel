@@ -44,10 +44,10 @@ from ..nn_modules.qlinear.fp8 import TorchFP8Linear
 from ..nn_modules.qlinear.lookahead import configure_default_lookahead
 from ..nn_modules.qlinear.torch import TorchLinear
 from ..quantization.config import (
-    AutoModuleDecoderConfig,
     FORMAT,
     METHOD,
     QUANTIZE_BLACK_LIST,
+    AutoModuleDecoderConfig,
     BaseQuantizeConfig,
     GcMode,
     VramStrategy,
@@ -122,8 +122,11 @@ def generate_node_for_awq_scaling(inp, prev_op, module_kwargs, nodes_size, subse
         "layers": subset,
         "inp": inp,
     }
-    if nodes_size == 0:
-        # Only the first node needs kwargs
+    if module_kwargs is not None:
+        # Preserve per-node kwargs for every scaling group. In multi-batch AWQ
+        # replays these can differ by feature bucket, so falling back to a
+        # layer-global "latest batch" mask on later nodes can reintroduce
+        # sequence-length mismatches during scale search.
         n["kwargs"] = module_kwargs
 
     if module2inspect is not None:
@@ -213,8 +216,17 @@ class BaseQModel(nn.Module):
     # monkey patch api for trust_remote_code=True models that have broken transformer compat
     require_monkeypatch = False
 
-    # VRAM strategy support list
-    supported_vram_strategies: List[VramStrategy] = [VramStrategy.EXCLUSIVE, VramStrategy.BALANCED]
+    # Dense-pool strategy support list
+    supported_dense_vram_strategies: List[VramStrategy] = [
+        VramStrategy.EXCLUSIVE,
+        VramStrategy.BALANCED,
+    ]
+
+    # MoE expert-pool strategy support list
+    supported_moe_vram_strategies: List[VramStrategy] = [
+        VramStrategy.EXCLUSIVE,
+        VramStrategy.BALANCED,
+    ]
 
     # some models have broken attention mask codes so we need to only use batch 1 with no masks
     support_batch_quantize = True
@@ -238,6 +250,9 @@ class BaseQModel(nn.Module):
     server = None
 
     support_offload_to_disk = True
+    # Optional runtime->checkpoint overrides for LazyTurtle. Prefer reversed
+    # `WeightRenaming` entries; legacy runtime->checkpoint dicts are still accepted.
+    HF_CONVERSION_MAP_REVERSED: Optional[Any] = None
 
     moe_expert_module_name_prefixes = [".expert"]
 
@@ -363,11 +378,27 @@ class BaseQModel(nn.Module):
             if node == "#":
                 break
             if isinstance(node, str):
-                prefix_parts.append(node)
+                module_name, _ = cls._parse_module_flags(node)
+                prefix_parts.append(module_name)
             else:
                 break  # stop if unexpected nested structure
 
         return [".".join(prefix_parts)] if prefix_parts else []
+
+    @classmethod
+    def _parse_module_aliases(cls, module_spec: str) -> List[str]:
+        """
+        Parse a module specification into its ordered runtime/checkpoint aliases.
+
+        The first alias is the runtime shell name. Any later aliases are
+        alternate checkpoint names declared directly in the model definition.
+        """
+        parts = module_spec.split(":") if isinstance(module_spec, str) else []
+        name = parts[0] if parts else module_spec
+        if not isinstance(name, str):
+            return [name]
+        aliases = [alias for alias in name.split("|") if alias]
+        return aliases or [name]
 
     @classmethod
     def _parse_module_flags(cls, module_spec: str) -> tuple[str, List[str]]:
@@ -376,7 +407,8 @@ class BaseQModel(nn.Module):
         Example: "gate:moe:!" -> ("gate", ["moe", "!"])
         """
         parts = module_spec.split(":") if isinstance(module_spec, str) else []
-        name = parts[0] if parts else module_spec
+        aliases = cls._parse_module_aliases(module_spec) if isinstance(module_spec, str) else [module_spec]
+        name = aliases[0] if aliases else module_spec
         flags = [p for p in parts[1:] if p]
         return name, flags
 
@@ -389,6 +421,15 @@ class BaseQModel(nn.Module):
             return False
         _, flags = cls._parse_module_flags(module_spec)
         return MOE_FLAG.lstrip(":") in flags
+
+    @classmethod
+    def resolve_hf_conversion_map_reversed(cls, target_model: Optional[nn.Module] = None) -> Optional[Any]:
+        configured_map = getattr(cls, "HF_CONVERSION_MAP_REVERSED", None)
+        if configured_map is not None:
+            return copy.deepcopy(configured_map)
+
+        inferred_map = LazyTurtle.infer_hf_conversion_map_reversed(target_model=target_model)
+        return copy.deepcopy(inferred_map) if inferred_map is not None else None
 
     @classmethod
     def _collect_moe_modules_from_tree(cls, tree_node, parent_path="", parent_is_moe=False) -> Set[str]:
@@ -539,16 +580,38 @@ class BaseQModel(nn.Module):
                     continue
 
                 if is_awq_quantize:
-                    # AWQ Required
-                    # result like: ['mlp.experts.0.gate_proj', 'mlp.experts.0.up_proj', 'mlp.experts.1.gate_proj', 'mlp.experts.1.up_proj', ...]
-                    for index in range(num_experts):
-                        for n in names:
-                            if EXPERT_INDEX_PLACEHOLDER in n:
-                                moe_simple[-1].append(n.replace(EXPERT_INDEX_PLACEHOLDER, str(index)))
-                    # added 'mlp.shared_expert.gate_proj', 'mlp.shared_expert.up_proj'
+                    # AWQ expands expert placeholders into concrete expert paths while
+                    # preserving the non-expert segments exactly where the model
+                    # definition placed them. This keeps the expanded block aligned
+                    # with forward execution order instead of forcing shared-expert
+                    # modules to the tail of every mixed MoE block.
+                    segments = []
+                    current_segment = []
+                    current_is_expert_segment = None
                     for n in names:
-                        if EXPERT_INDEX_PLACEHOLDER not in n:
-                            moe_simple[-1].append(n)
+                        is_expert_entry = EXPERT_INDEX_PLACEHOLDER in n
+                        if current_is_expert_segment is None:
+                            current_is_expert_segment = is_expert_entry
+                        if is_expert_entry != current_is_expert_segment:
+                            segments.append((current_is_expert_segment, current_segment))
+                            current_segment = []
+                            current_is_expert_segment = is_expert_entry
+                        current_segment.append(n)
+
+                    if current_segment:
+                        segments.append((current_is_expert_segment, current_segment))
+
+                    # Example:
+                    # ['shared_expert.gate_proj', 'shared_expert.up_proj', 'experts.#.gate_proj', 'experts.#.up_proj']
+                    # becomes
+                    # ['shared_expert.gate_proj', 'shared_expert.up_proj', 'experts.0.gate_proj', 'experts.0.up_proj', ...]
+                    for is_expert_segment, segment_names in segments:
+                        if not is_expert_segment:
+                            moe_simple[-1].extend(segment_names)
+                            continue
+                        for index in range(num_experts):
+                            for n in segment_names:
+                                moe_simple[-1].append(n.replace(EXPERT_INDEX_PLACEHOLDER, str(index)))
                     # Currently, only need to add `capture_only_modules` to `['mlp.experts.#.gate_proj', 'mlp.experts.#.up_proj']`
                     # or ['mlp.shared_expert.gate_proj', 'mlp.shared_expert.up_proj', 'mlp.experts.#.gate_proj', 'mlp.experts.#.up_proj']
                     # or ['mlp.shared_experts.gate_proj', 'mlp.shared_experts.up_proj', 'mlp.experts.#.gate_proj', 'mlp.experts.#.up_proj']
@@ -2192,6 +2255,16 @@ class BaseQModel(nn.Module):
         last_module = None  # most recent norm obj (from a '!...' block)
         last_module_name = None
         last_module_root = None  # self_attn.* has root == self_attn, mlp.* has root == mlp
+        if isinstance(module_kwargs, dict):
+            per_feature_kwargs = module_kwargs.get("_awq_feature_kwargs", {})
+            base_module_kwargs = {
+                key: value
+                for key, value in module_kwargs.items()
+                if key != "_awq_feature_kwargs"
+            }
+        else:
+            per_feature_kwargs = {}
+            base_module_kwargs = module_kwargs
 
         if self.model.config is not None and self.dynamic_expert_index is not None:
             self.get_num_experts(self.model.config)
@@ -2227,6 +2300,14 @@ class BaseQModel(nn.Module):
             if "." in candidate_name:
                 last_module_root = candidate_name.split(".", 1)[0]
             return True
+
+        def _module_kwargs_for_feature(feature_name: str | None):
+            kwargs_for_feature = dict(base_module_kwargs)
+            if feature_name and isinstance(per_feature_kwargs, dict):
+                feature_specific_kwargs = per_feature_kwargs.get(feature_name)
+                if isinstance(feature_specific_kwargs, dict):
+                    kwargs_for_feature.update(feature_specific_kwargs)
+            return kwargs_for_feature
 
         full_layer_modules = self.full_layer_modules(
             self.model.config,
@@ -2265,8 +2346,9 @@ class BaseQModel(nn.Module):
                         log.debug("awq_get_modules_for_scaling: skipping missing expert module `%s`", name)
                         continue
                     subset = [m]
+                    feature_name = name
                     n, root = generate_node_for_awq_scaling(inp=input_feat[name], prev_op=prev_op,
-                                                            module_kwargs=module_kwargs, nodes_size=len(nodes),
+                                                            module_kwargs=_module_kwargs_for_feature(feature_name), nodes_size=len(nodes),
                                                             subset=subset, module2inspect=None)
                     if root is not None and last_module_root != root:
                         last_module_root = root
@@ -2320,25 +2402,28 @@ class BaseQModel(nn.Module):
                             last_module_root,
                             len(block),
                         )
+                    feature_name = last_module_root if last_module_root in input_feat else _select_feature_name(block)
                     inp = input_feat.get(last_module_root, input_feat.get(_select_feature_name(block)))
                 else:
-                    inp = input_feat.get(_select_feature_name(block))
+                    feature_name = _select_feature_name(block)
+                    inp = input_feat.get(feature_name)
 
                 if inp is None:
                     log.debug("awq_get_modules_for_scaling: skipping block %s due to missing input features", block)
                     continue
 
                 n, root = generate_node_for_awq_scaling(inp=inp, prev_op=prev_op,
-                                                        module_kwargs=module_kwargs, nodes_size=len(nodes),
+                                                        module_kwargs=_module_kwargs_for_feature(feature_name), nodes_size=len(nodes),
                                                         subset=subset, module2inspect=module2inspect)
 
                 nodes.append(n)
 
             # Update tracker to the LAST item of this block
             if is_moe_gate_up_block:
-                # The block content is [...,  mlp.experts.{last_index}.up_proj, shared_expert.gate_proj, shared_expert.up_proj, mlp]
-                # mlp.experts.{last_index}.up_proj should be selected as last_module
-                # Find all indices that contain both ".experts" and "gate_proj"/"up_proj"
+                # Mixed MoE blocks can legitimately place shared-expert projections
+                # before or after routed experts depending on real forward order.
+                # For AWQ scaling, we still want the last routed expert gate/up proj
+                # as the effective boundary for the expert segment in this block.
                 gate_up_proj_indices = [
                     i for i, name in enumerate(block)
                     if any(k in name for k in self.moe_expert_module_name_prefixes) and ("gate" in name or "up" in name)
@@ -2415,6 +2500,27 @@ class BaseQModel(nn.Module):
                 return module
 
             turtle_model = self.turtle_model
+            if role == "forward" and named_module is not None and isinstance(turtle_model, LazyTurtle):
+                checkpoint_tensors = turtle_model.checkpoint_tensors_for_submodule(
+                    target_model=self.model,
+                    target_submodule=target_submodule,
+                    recurse=False,
+                )
+                weight = checkpoint_tensors.get("weight")
+                if isinstance(weight, torch.Tensor):
+                    decoder_kind = self._decoder_weight_format(
+                        weight=weight,
+                        checkpoint_tensors=checkpoint_tensors,
+                    )
+                    if decoder_kind is not None:
+                        # Packed floatx checkpoints can require decoder-specific
+                        # materialization before any dense shell weight exists.
+                        return self._prepare_auto_decoder_forward_module(
+                            target_submodule=target_submodule,
+                            device=torch.device(device),
+                            named_module=named_module,
+                        )
+
             if turtle_model is None:
                 if get_device(target_submodule) != device:
                     target_submodule.to(device)
@@ -2485,10 +2591,7 @@ class BaseQModel(nn.Module):
         group_seq = count()
 
         def _parse_token(token: str) -> tuple[str, List[str]]:
-            parts = token.split(":")
-            name = parts[0]
-            flags = [p for p in parts[1:] if p]
-            return name, flags
+            return cls._parse_module_flags(token)
 
         def _group_from_flags(flags: List[str]) -> int:
             for flag in flags:
@@ -2696,14 +2799,14 @@ class BaseQModel(nn.Module):
 
         assert sharp_idx > 0, "failed to get_base_modules"
         # root_path = ["model"] or ["model", "language_model"]
-        root_path = tree[:sharp_idx-1]
+        root_path = [cls._parse_module_flags(node)[0] if isinstance(node, str) else node for node in tree[:sharp_idx-1]]
 
         out = []
         # Traverse each layer in root_path
         for i in range(len(root_path)):
             path = root_path[:i + 1]
             base = model
-            exclude = tree[len(path)]
+            exclude = cls._parse_module_flags(tree[len(path)])[0] if isinstance(tree[len(path)], str) else tree[len(path)]
 
             for node in path:
                 base = getattr(base, node)
@@ -2730,6 +2833,7 @@ class BaseQModel(nn.Module):
         if isinstance(node, dict):
             new_dict = {}
             for k, v in node.items():
+                clean_key = self._parse_module_flags(k)[0] if isinstance(k, str) else k
                 # Expand tuple-of-strings blocks (special handling)
                 if isinstance(v, (tuple, list)) and all(isinstance(x, str) for x in v):
                     # Rule 1: check if ALL entries are :!
@@ -2737,16 +2841,16 @@ class BaseQModel(nn.Module):
                         continue  # skip this parent entirely
 
                     # Rule 2: strip :! and :digit markers
-                    cleaned = tuple(x.split(":")[0] for x in v)
-                    new_dict[k] = cleaned
+                    cleaned = tuple(self._parse_module_flags(x)[0] for x in v)
+                    new_dict[clean_key] = cleaned
                 else:
                     # Recurse deeper
-                    new_dict[k] = self.generate_layers_modules_tree_simple(v)
+                    new_dict[clean_key] = self.generate_layers_modules_tree_simple(v)
             return new_dict
 
         # If it's a plain string (unlikely here), strip markers
         if isinstance(node, str):
-            return node.split(":")[0]
+            return self._parse_module_flags(node)[0]
 
         # For other types, return as-is
         return node

@@ -3,11 +3,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
 
-
-import pcre as re
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Union
 
+import pcre
 import safetensors
 import torch
 
@@ -271,7 +270,7 @@ class Lora(Adapter):
                 k = k.lower()
                 assert v > 0 # check for invalid rank range
                 # first do string full match, then suffix match, then regex match
-                if weight_key == k or k.endswith(weight_key) or re.match(k, weight_key):
+                if weight_key == k or k.endswith(weight_key) or pcre.compile(k).match(weight_key):
                     self.rank = v
                     log.info(f"Adapter: Base Lora `rank` = `{self.rank}` has been overridden by `{k}` due to dynamic `LoraConfig.rank_pattern` control.")
                     return True
@@ -304,6 +303,8 @@ def normalize_adapter(adapter:  Union[Dict, Adapter]):
     if not isinstance(adapter, Dict):
         raise ValueError("Adapter: Invalid adapter config: `adapter`.")
 
+    # Callers may reuse serialized adapter payloads across retries.
+    adapter = dict(adapter)
     adapter_type = adapter.pop("name", None)
     if adapter_type is None:
         raise ValueError(f"Adapter: Invalid adapter class `{adapter_type}`: expected = `{ADAPTER_MAPPING}`.")

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import threading
 import time
@@ -186,6 +187,63 @@ def test_cuda_include_paths_with_fallback_skip_wheel_headers_when_local_cuda_has
     assert include_paths == ["/tmp/extension"]
 
 
+def test_cuda_cache_fingerprint_payload_includes_resolved_arch_flags(monkeypatch, tmp_path):
+    """Guard CUDA cache keys so stale binaries cannot cross architecture targets."""
+
+    loader = _make_loader(tmp_path, requires_cuda=True)
+
+    monkeypatch.delenv("TORCH_CUDA_ARCH_LIST", raising=False)
+    monkeypatch.setattr(cpp_module.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(cpp_module.torch.cuda, "device_count", lambda: 1)
+    monkeypatch.setattr(cpp_module.torch.cuda, "get_device_capability", lambda _index: (12, 0))
+    monkeypatch.setattr(
+        cpp_module,
+        "resolved_cuda_arch_flags",
+        lambda: [
+            "-gencode=arch=compute_120,code=compute_120",
+            "-gencode=arch=compute_120,code=sm_120",
+        ],
+    )
+
+    payload = loader._cuda_cache_fingerprint_payload()
+
+    assert payload == [
+        "cuda_ext=1",
+        "visible_caps=12.0",
+        (
+            "resolved_arch_flags="
+            "-gencode=arch=compute_120,code=compute_120,"
+            "-gencode=arch=compute_120,code=sm_120"
+        ),
+    ]
+
+
+def test_default_torch_ops_build_root_ignores_removed_global_override(monkeypatch):
+    monkeypatch.setenv("GPTQMODEL_EXT_BUILD_BASE", "/tmp/obsolete-jit-root")
+
+    assert cpp_module.default_torch_ops_build_root("marlin") == (
+        Path.home() / ".cache" / "gptqmodel" / "torch_extensions" / "marlin"
+    )
+
+
+def test_default_torch_ops_build_root_respects_ci_override(monkeypatch):
+    monkeypatch.setenv("GPTQMODEL_TORCH_EXTENSIONS_DIR", "/tmp/gptqmodel-ci")
+
+    assert cpp_module.default_torch_ops_build_root("marlin") == Path("/tmp/gptqmodel-ci") / "marlin"
+
+
+def test_torch_ops_jit_extension_prefers_explicit_build_root_over_global_default(monkeypatch, tmp_path):
+    loader = _make_loader(
+        tmp_path,
+        default_build_root=lambda: cpp_module.default_torch_ops_build_root("unit_test_ops"),
+    )
+
+    monkeypatch.setenv("GPTQMODEL_TORCH_EXTENSIONS_DIR", "/tmp/gptqmodel-ci")
+    monkeypatch.setenv("UNIT_TEST_BUILD_ROOT", "/tmp/unit-test-override")
+
+    assert loader.base_build_root() == Path("/tmp/unit-test-override")
+
+
 def test_torch_ops_jit_extension_prefers_cached_binary(monkeypatch, tmp_path):
     """Guard cache reuse so startup skips expensive JIT rebuilds when ops are already built."""
 
@@ -228,6 +286,43 @@ def test_torch_ops_jit_extension_force_rebuild_clears_cache(monkeypatch, tmp_pat
     runtime = type("RuntimeNamespace", (), {"kernel": object()})()
 
     monkeypatch.setenv("UNIT_TEST_FORCE_REBUILD", "1")
+    monkeypatch.setattr(loader, "_ops_available", lambda: state["ready"])
+    monkeypatch.setattr(cpp_module, "setup_logger", lambda: logger)
+    monkeypatch.setattr(
+        cpp_module.torch.ops,
+        "load_library",
+        lambda path: (_ for _ in ()).throw(AssertionError(f"unexpected cached load: {path}")),
+        raising=False,
+    )
+
+    def fake_compile(**kwargs):
+        compile_calls.append(kwargs)
+        state["ready"] = True
+        monkeypatch.setattr(cpp_module.torch.ops, "unit_test_ns", runtime, raising=False)
+
+    monkeypatch.setattr(cpp_module, "load", fake_compile)
+
+    assert loader.load() is True
+    assert len(compile_calls) == 1
+    assert stale_library.exists() is False
+    assert any("clearing cached JIT extension" in message for message in logger.info_messages)
+
+
+def test_torch_ops_jit_extension_global_kernel_rebuild_clears_cache(monkeypatch, tmp_path):
+    """Guard the umbrella rebuild flag so every torch.ops extension gets cold-build behavior."""
+
+    loader = _make_loader(tmp_path)
+    build_root = loader.build_root()
+    build_root.mkdir(parents=True)
+    stale_library = build_root / "unit_test_ops.so"
+    stale_library.write_bytes(b"stale")
+
+    state = {"ready": False}
+    compile_calls = []
+    logger = _FakeLogger()
+    runtime = type("RuntimeNamespace", (), {"kernel": object()})()
+
+    monkeypatch.setenv("GPTQMODEL_KERNEL_REBUILD", "1")
     monkeypatch.setattr(loader, "_ops_available", lambda: state["ready"])
     monkeypatch.setattr(cpp_module, "setup_logger", lambda: logger)
     monkeypatch.setattr(
@@ -326,6 +421,106 @@ def test_torch_ops_jit_extension_appends_detected_cuda_include_paths(monkeypatch
         "/tmp/nvidia/cu13/include",
         "/tmp/nvidia/cusparse/include",
     ]
+
+
+def test_torch_ops_jit_extension_merges_visible_capability_into_compile_override(monkeypatch, tmp_path):
+    """Guard CUDA JIT builds so manual arch overrides still compile for the visible GPU."""
+
+    loader = _make_loader(
+        tmp_path,
+        requires_cuda=True,
+    )
+
+    state = {"ready": False}
+    compile_arch_lists = []
+    runtime = type("RuntimeNamespace", (), {"kernel": object()})()
+
+    monkeypatch.setattr(loader, "_ops_available", lambda: state["ready"])
+    monkeypatch.setenv("TORCH_CUDA_ARCH_LIST", "8.9+PTX")
+    monkeypatch.setattr(cpp_module.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(cpp_module.torch.cuda, "device_count", lambda: 1)
+    monkeypatch.setattr(cpp_module.torch.cuda, "get_device_capability", lambda device_index=0: (8, 0))
+    monkeypatch.setattr(cpp_module.torch.cuda, "get_arch_list", lambda: ["sm_80", "sm_89"])
+    monkeypatch.setattr(cpp_module, "_get_cuda_arch_flags", lambda: [os.environ["TORCH_CUDA_ARCH_LIST"]])
+
+    def fake_compile(**kwargs):
+        del kwargs
+        compile_arch_lists.append(os.environ["TORCH_CUDA_ARCH_LIST"])
+        state["ready"] = True
+        monkeypatch.setattr(cpp_module.torch.ops, "unit_test_ns", runtime, raising=False)
+
+    monkeypatch.setattr(cpp_module, "load", fake_compile)
+
+    assert loader.load() is True
+    assert compile_arch_lists == ["8.9+PTX;8.0"]
+    assert os.environ["TORCH_CUDA_ARCH_LIST"] == "8.9+PTX"
+
+
+def test_torch_ops_jit_extension_can_skip_visible_capability_merge_when_requested(monkeypatch, tmp_path):
+    """Guard Hopper-only build flows so forced arch overrides can stay isolated from local GPUs."""
+
+    loader = _make_loader(
+        tmp_path,
+        requires_cuda=True,
+        merge_visible_cuda_arch_override=False,
+    )
+
+    state = {"ready": False}
+    compile_arch_lists = []
+    runtime = type("RuntimeNamespace", (), {"kernel": object()})()
+
+    monkeypatch.setattr(loader, "_ops_available", lambda: state["ready"])
+    monkeypatch.setenv("TORCH_CUDA_ARCH_LIST", "9.0a")
+    monkeypatch.setattr(cpp_module.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(cpp_module.torch.cuda, "device_count", lambda: 1)
+    monkeypatch.setattr(cpp_module.torch.cuda, "get_device_capability", lambda device_index=0: (8, 0))
+    monkeypatch.setattr(cpp_module.torch.cuda, "get_arch_list", lambda: ["sm_80", "sm_90a"])
+    monkeypatch.setattr(cpp_module, "_get_cuda_arch_flags", lambda: [os.environ["TORCH_CUDA_ARCH_LIST"]])
+
+    def fake_compile(**kwargs):
+        del kwargs
+        compile_arch_lists.append(os.environ["TORCH_CUDA_ARCH_LIST"])
+        state["ready"] = True
+        monkeypatch.setattr(cpp_module.torch.ops, "unit_test_ns", runtime, raising=False)
+
+    monkeypatch.setattr(cpp_module, "load", fake_compile)
+
+    assert loader.load() is True
+    assert compile_arch_lists == ["9.0a"]
+    assert os.environ["TORCH_CUDA_ARCH_LIST"] == "9.0a"
+
+
+def test_torch_ops_jit_extension_uses_original_compile_paths(monkeypatch, tmp_path):
+    local_root = tmp_path / "repo"
+    (local_root / "src").mkdir(parents=True)
+    (local_root / "include").mkdir(parents=True)
+    source_path = local_root / "src" / "unit_test.cpp"
+    include_path = local_root / "include"
+    source_path.write_text('#include "unit_test.h"\nint kernel() { return 1; }\n', encoding="utf-8")
+    (include_path / "unit_test.h").write_text("inline int unit_test_header() { return 1; }\n", encoding="utf-8")
+
+    loader = _make_loader(
+        tmp_path,
+        sources=[str(source_path)],
+        extra_include_paths=[str(include_path), "/usr/local/cuda/include"],
+    )
+
+    state = {"ready": False}
+    compile_calls = []
+    runtime = type("RuntimeNamespace", (), {"kernel": object()})()
+
+    monkeypatch.setattr(loader, "_ops_available", lambda: state["ready"])
+
+    def fake_compile(**kwargs):
+        compile_calls.append(kwargs)
+        state["ready"] = True
+        monkeypatch.setattr(cpp_module.torch.ops, "unit_test_ns", runtime, raising=False)
+
+    monkeypatch.setattr(cpp_module, "load", fake_compile)
+
+    assert loader.load() is True
+    assert compile_calls[0]["sources"] == [str(source_path)]
+    assert compile_calls[0]["extra_include_paths"] == [str(include_path), "/usr/local/cuda/include"]
 
 
 def test_torch_ops_jit_extension_skips_cuda_wheel_include_paths_when_local_headers_exist(monkeypatch, tmp_path):
@@ -491,6 +686,48 @@ def test_torch_ops_jit_extension_cuda_fingerprint_prefers_arch_override(monkeypa
     assert first_build_root != second_build_root
 
 
+def test_resolved_cuda_arch_flags_appends_visible_capability_missing_from_override(monkeypatch):
+    """Guard JIT arch resolution so manual overrides still build for the currently visible GPU."""
+
+    monkeypatch.setenv("TORCH_CUDA_ARCH_LIST", "8.0 8.6")
+    monkeypatch.setattr(cpp_module.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(cpp_module.torch.cuda, "device_count", lambda: 1)
+    monkeypatch.setattr(cpp_module.torch.cuda, "get_device_capability", lambda device_index=0: (7, 5))
+    monkeypatch.setattr(cpp_module.torch.cuda, "get_arch_list", lambda: ["sm_75", "sm_80", "sm_86"])
+
+    seen = {}
+
+    def fake_get_cuda_arch_flags():
+        seen["arch_list"] = os.environ["TORCH_CUDA_ARCH_LIST"]
+        return [seen["arch_list"]]
+
+    monkeypatch.setattr(cpp_module, "_get_cuda_arch_flags", fake_get_cuda_arch_flags)
+
+    assert cpp_module.resolved_cuda_arch_flags() == ["8.0;8.6;7.5"]
+    assert seen["arch_list"] == "8.0;8.6;7.5"
+    assert os.environ["TORCH_CUDA_ARCH_LIST"] == "8.0 8.6"
+
+
+def test_torch_ops_jit_extension_cuda_fingerprint_tracks_visible_capabilities_even_with_override(monkeypatch, tmp_path):
+    """Guard cache keys so fixed arch overrides cannot reuse binaries across omitted visible GPU targets."""
+
+    loader = _make_loader(tmp_path, requires_cuda=True)
+
+    monkeypatch.setenv("TORCH_CUDA_ARCH_LIST", "8.0")
+    monkeypatch.setattr(cpp_module.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(cpp_module.torch.cuda, "device_count", lambda: 1)
+    monkeypatch.setattr(cpp_module.torch.cuda, "get_arch_list", lambda: ["sm_75", "sm_80", "sm_89"])
+    monkeypatch.setattr(cpp_module, "_get_cuda_arch_flags", lambda: [os.environ["TORCH_CUDA_ARCH_LIST"]])
+
+    monkeypatch.setattr(cpp_module.torch.cuda, "get_device_capability", lambda device_index=0: (7, 5))
+    first_build_root = loader.build_root()
+
+    monkeypatch.setattr(cpp_module.torch.cuda, "get_device_capability", lambda device_index=0: (8, 9))
+    second_build_root = loader.build_root()
+
+    assert first_build_root != second_build_root
+
+
 def test_torch_ops_jit_extension_cuda_fingerprint_tracks_detected_include_paths(monkeypatch, tmp_path):
     """Guard cache keys so CUDA wheel header layout changes invalidate old JIT binaries."""
 
@@ -506,6 +743,28 @@ def test_torch_ops_jit_extension_cuda_fingerprint_tracks_detected_include_paths(
         "detected_cuda_wheel_include_paths",
         lambda: ["/tmp/nvidia/cu13/include", "/tmp/nvidia/cusparse/include"],
     )
+    second_build_root = loader.build_root()
+
+    assert first_build_root != second_build_root
+
+
+def test_torch_ops_jit_extension_fingerprint_tracks_transitive_local_includes(tmp_path):
+    """Guard cache keys so changes under quoted transitive includes rebuild stale entrypoint binaries."""
+
+    source_root = tmp_path / "src"
+    source_root.mkdir()
+    entry = source_root / "entry.cpp"
+    middle = source_root / "middle.h"
+    leaf = source_root / "leaf.inc"
+
+    entry.write_text('#include "middle.h"\nint kernel() { return answer(); }\n', encoding="utf-8")
+    middle.write_text('#include "leaf.inc"\ninline int answer() { return ANSWER_VALUE; }\n', encoding="utf-8")
+    leaf.write_text("#define ANSWER_VALUE 1\n", encoding="utf-8")
+
+    loader = _make_loader(tmp_path, sources=[str(entry)])
+    first_build_root = loader.build_root()
+
+    leaf.write_text("#define ANSWER_VALUE 12345\n", encoding="utf-8")
     second_build_root = loader.build_root()
 
     assert first_build_root != second_build_root

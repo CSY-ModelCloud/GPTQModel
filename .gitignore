@@ -193,3 +193,7 @@ example.py
 *.csv
 /gptqmodel_ext/machete/generated/
 AGENT.md
+AGENTs.md
+.codex
+temp
+tmp

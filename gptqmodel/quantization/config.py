@@ -7,6 +7,7 @@ import copy
 import json
 import math
 import os.path
+import tempfile
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
@@ -14,16 +15,39 @@ from functools import total_ordering
 from os.path import join
 from typing import Any, ClassVar, Dict, List, Optional, Tuple, Union
 
-import pcre as re
+import pcre
 import torch
 from packaging import version
 
 from ..adapter.adapter import Lora, normalize_adapter
 from ..utils.logger import setup_logger
-from ..utils.random_str import get_random_string
-
 
 log = setup_logger()
+
+
+class _SharedTemporaryDirectory:
+    """Share one TemporaryDirectory handle across copied config objects."""
+
+    def __init__(self, *, prefix: str):
+        self._temp_dir = tempfile.TemporaryDirectory(prefix=prefix)
+
+    @property
+    def name(self) -> str:
+        return self._temp_dir.name
+
+    def cleanup(self) -> None:
+        self._temp_dir.cleanup()
+
+    def __copy__(self):
+        return self
+
+    def __deepcopy__(self, memo):
+        memo[id(self)] = self
+        return self
+
+
+def _create_temp_offload_dir() -> _SharedTemporaryDirectory:
+    return _SharedTemporaryDirectory(prefix="gptqmodel_")
 
 _DECODER_TARGET_DTYPE_MAP = {
     "float16": torch.float16,
@@ -114,7 +138,7 @@ class METHOD(str, Enum):
 
 
 class VramStrategy(str, Enum):
-    """Strategies for assigning quantization work across available VRAM."""
+    """Placement strategies shared by dense and MoE device pools."""
 
     EXCLUSIVE = "exclusive"
     BALANCED = "balanced"
@@ -460,7 +484,7 @@ class GGUFBits(BaseComplexBits):
 QuantBits = GGUFBits
 
 
-_GGUF_PUBLIC_FORMAT_RE = re.compile(r"^(q|iq)_(0|k)(?:_(xs|s|m|l|g128))?$")
+_GGUF_PUBLIC_FORMAT_RE = pcre.compile(r"^(q|iq)_(0|k)(?:_(xs|s|m|l|g128))?$")
 
 
 def _gguf_public_format_from_bits(bits: GGUFBits) -> str:
@@ -1670,9 +1694,9 @@ def dynamic_get(dynamic: Dict[str, Dict[str, Union[int, bool]]], module_name: st
 
     for pattern, overrides in dynamic.items():
         if pattern.startswith("-:"):
-            if re.match(pattern.removeprefix("-:"), module_name):
+            if pcre.compile(pattern.removeprefix("-:")).match(module_name):
                 return False
-        elif re.match(pattern.removeprefix("+:"), module_name):
+        elif pcre.compile(pattern.removeprefix("+:")).match(module_name):
             if key is None:
                 return overrides
             else:
@@ -1878,19 +1902,70 @@ def _normalize_foem(foem: Optional[Union[FOEMConfig, Dict[str, Any]]]) -> Option
     return foem
 
 
-def _normalize_vram_strategy(value: Union[str, VramStrategy]) -> VramStrategy:
+def _normalize_dense_vram_strategy(value: Union[str, VramStrategy]) -> VramStrategy:
+    """Validate one user-supplied dense-pool placement strategy value."""
+
     if isinstance(value, str):
         try:
             return VramStrategy(value.lower())
         except ValueError as exc:
             raise ValueError(
-                f"QuantizeConfig: `vram_strategy` must be one of {[v.value for v in VramStrategy]}."
+                f"QuantizeConfig: `dense_vram_strategy` must be one of {[v.value for v in VramStrategy]}."
             ) from exc
     if not isinstance(value, VramStrategy):
         raise ValueError(
-            f"QuantizeConfig: `vram_strategy` must be one of {[v.value for v in VramStrategy]}."
+            f"QuantizeConfig: `dense_vram_strategy` must be one of {[v.value for v in VramStrategy]}."
         )
     return value
+
+
+def _normalize_moe_vram_strategy(value: Union[str, VramStrategy]) -> VramStrategy:
+    """Validate one user-supplied MoE expert-pool placement strategy value."""
+
+    if isinstance(value, str):
+        try:
+            return VramStrategy(value.lower())
+        except ValueError as exc:
+            raise ValueError(
+                f"QuantizeConfig: `moe_vram_strategy` must be one of {[v.value for v in VramStrategy]}."
+            ) from exc
+    if not isinstance(value, VramStrategy):
+        raise ValueError(
+            f"QuantizeConfig: `moe_vram_strategy` must be one of {[v.value for v in VramStrategy]}."
+        )
+    return value
+
+
+def _normalize_strategy_devices(
+    value: Optional[List[Union[str, torch.device]]],
+    *,
+    field_name: str,
+) -> Optional[List[str]]:
+    """Normalize one user-facing strategy device pool to stable device strings."""
+
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise ValueError(f"QuantizeConfig: `{field_name}` must be a list of device strings or torch.device values.")
+    if not value:
+        raise ValueError(f"QuantizeConfig: `{field_name}` must not be empty when provided.")
+
+    # Import lazily to keep config parsing light and avoid depending on looper
+    # modules unless the caller actually configures explicit device pools.
+    from ..utils.looper_helpers import normalize_device_like
+
+    normalized_devices: List[str] = []
+    seen = set()
+    for raw_device in value:
+        normalized = normalize_device_like(raw_device)
+        if normalized is None:
+            raise ValueError(f"QuantizeConfig: `{field_name}` contains an unsupported device value: {raw_device!r}.")
+        key = str(normalized)
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized_devices.append(key)
+    return normalized_devices
 
 
 def _normalize_gc_mode(value: Union[str, GcMode]) -> GcMode:
@@ -2275,6 +2350,7 @@ class BaseQuantizeConfig(metaclass=QuantizeConfigMeta):
         default=None,
         metadata={"help": "Offload disk path. Only applicable if Offload to disk is enabled"},
     )
+    _offload_temp_dir: Optional[_SharedTemporaryDirectory] = field(default=None, init=False, repr=False, compare=False)
 
     rotation: Optional[str] = field(default=None, metadata={"choices": ["hadamard", "random"]})
 
@@ -2301,7 +2377,29 @@ class BaseQuantizeConfig(metaclass=QuantizeConfigMeta):
         "leading in some cases to slower forwarding or vram OOM"}
     )
 
-    vram_strategy: VramStrategy = field(default=VramStrategy.EXCLUSIVE)
+    # User-facing dense-pool strategy. The dense pool owns the serial path:
+    # qkv, z, out_proj, norms, router, shared expert, and dense MLP modules.
+    dense_vram_strategy: VramStrategy = field(
+        default=VramStrategy.EXCLUSIVE,
+        metadata={"help": "Dense pool placement strategy. The dense pool owns qkv, z, out_proj, norms, router, shared expert, and dense MLP modules."},
+    )
+    # Optional dense-pool device list, relative to CUDA_VISIBLE_DEVICES. In
+    # BALANCED mode, model-tree calculation groups stay together, so qkv is not split.
+    dense_vram_strategy_devices: Optional[List[Union[str, torch.device]]] = field(
+        default=None,
+        metadata={"help": "Explicit device pool for dense modules. In dense BALANCED mode, modules are assigned by calculation groups, so qkv stays co-located."},
+    )
+    # User-facing expert-pool strategy. Expert families are placed as whole
+    # units so gate/up/down for one expert stay on the same device.
+    moe_vram_strategy: VramStrategy = field(
+        default=VramStrategy.EXCLUSIVE,
+        metadata={"help": "MoE expert-pool placement strategy. Expert families stay co-located and can be balanced across this pool."},
+    )
+    # Optional expert-pool device list, relative to CUDA_VISIBLE_DEVICES.
+    moe_vram_strategy_devices: Optional[List[Union[str, torch.device]]] = field(
+        default=None,
+        metadata={"help": "Explicit device pool for MoE expert modules. Each expert family (gate/up/down) stays on one device."},
+    )
 
     gc_mode: GcMode = field(
         default=GcMode.INTERVAL,
@@ -2387,6 +2485,12 @@ class BaseQuantizeConfig(metaclass=QuantizeConfigMeta):
     def default_desc_act(self) -> bool:
         return True
 
+    def _ensure_offload_temp_dir(self) -> None:
+        if self.offload_to_disk and not self.offload_to_disk_path:
+            self._offload_temp_dir = _create_temp_offload_dir()
+            self.offload_to_disk_path = self._offload_temp_dir.name
+            log.info(f"QuantizeConfig: offload_to_disk_path auto set to temporary dir `{self.offload_to_disk_path}`")
+
     def __post_init__(self):
         fields_info = fields(self)
 
@@ -2451,13 +2555,18 @@ class BaseQuantizeConfig(metaclass=QuantizeConfigMeta):
             self.meta = {}
 
         self.adapter = normalize_adapter(self.adapter)
+        self._ensure_offload_temp_dir()
 
-        if self.offload_to_disk and not self.offload_to_disk_path:
-            path_key = f"{get_random_string()}-{get_random_string()}"
-            self.offload_to_disk_path = f"./gptqmodel_offload/{path_key}/"
-            log.info(f"QuantizeConfig: offload_to_disk_path auto set to `{self.offload_to_disk_path}`")
-
-        self.vram_strategy = _normalize_vram_strategy(self.vram_strategy)
+        self.dense_vram_strategy = _normalize_dense_vram_strategy(self.dense_vram_strategy)
+        self.dense_vram_strategy_devices = _normalize_strategy_devices(
+            self.dense_vram_strategy_devices,
+            field_name="dense_vram_strategy_devices",
+        )
+        self.moe_vram_strategy = _normalize_moe_vram_strategy(self.moe_vram_strategy)
+        self.moe_vram_strategy_devices = _normalize_strategy_devices(
+            self.moe_vram_strategy_devices,
+            field_name="moe_vram_strategy_devices",
+        )
         self.gc_mode = _normalize_gc_mode(self.gc_mode)
         self.moe = _normalize_moe_config(self.moe)
 
@@ -2670,7 +2779,10 @@ class BaseQuantizeConfig(metaclass=QuantizeConfigMeta):
             "gc_mode": "gc_mode",
             "wait_for_submodule_finalizers": "wait_for_submodule_finalizers",
             "auto_forward_data_parallel": "auto_forward_data_parallel",
-            "vram_strategy": "vram_strategy",
+            "dense_vram_strategy": "dense_vram_strategy",
+            "dense_vram_strategy_devices": "dense_vram_strategy_devices",
+            "moe_vram_strategy": "moe_vram_strategy",
+            "moe_vram_strategy_devices": "moe_vram_strategy_devices",
             "moe": "moe",
             "offload_to_disk": "offload_to_disk",
             "offload_to_disk_path": "offload_to_disk_path",
@@ -2710,6 +2822,7 @@ class BaseQuantizeConfig(metaclass=QuantizeConfigMeta):
             "opt_quantizer_impl": "opt_quantizer_impl",
             "opt_channel_scale_clamp_min": "opt_channel_scale_clamp_min",
             "opt_channel_scale_clamp_max": "opt_channel_scale_clamp_max",
+            "scale_search_chunked_activations": "scale_search_chunked_activations",
         }
         if isinstance(meta_payload, dict):
             for normalized_key, meta_key in meta_field_map.items():
@@ -2801,9 +2914,18 @@ class BaseQuantizeConfig(metaclass=QuantizeConfigMeta):
         meta_payload["gc_mode"] = self.gc_mode.value if isinstance(self.gc_mode, GcMode) else self.gc_mode
         meta_payload["wait_for_submodule_finalizers"] = self.wait_for_submodule_finalizers
         meta_payload["auto_forward_data_parallel"] = self.auto_forward_data_parallel
-        meta_payload["vram_strategy"] = (
-            self.vram_strategy.value if isinstance(self.vram_strategy, VramStrategy) else self.vram_strategy
+        meta_payload["dense_vram_strategy"] = (
+            self.dense_vram_strategy.value
+            if isinstance(self.dense_vram_strategy, VramStrategy)
+            else self.dense_vram_strategy
         )
+        meta_payload["dense_vram_strategy_devices"] = self.dense_vram_strategy_devices
+        meta_payload["moe_vram_strategy"] = (
+            self.moe_vram_strategy.value
+            if isinstance(self.moe_vram_strategy, VramStrategy)
+            else self.moe_vram_strategy
+        )
+        meta_payload["moe_vram_strategy_devices"] = self.moe_vram_strategy_devices
         self._update_meta_payload(meta_payload)
 
         out = {
@@ -3023,12 +3145,23 @@ class GPTQConfig(PreProcessorConfig):
 class AWQConfig(PreProcessorConfig):
     method: METHOD = field(default=METHOD.AWQ)
     format: FORMAT = field(default=FORMAT.GEMM)
+    scale_search_chunked_activations: bool = field(
+        default=True,
+        metadata={
+            "help": "Stream and chunk AWQ scale-search activations to reduce peak memory during reference and reconstruction forwards."
+        },
+    )
 
     def allowed_quant_methods(self) -> Tuple[METHOD, ...]:
         return (METHOD.AWQ,)
 
     def supported_export_formats(self) -> Tuple[FORMAT, ...]:
         return AWQ_EXPORT_FORMATS
+
+    def default_desc_act(self) -> bool:
+        # AWQ runtimes do not use GPTQ-style activation reordering unless the
+        # checkpoint explicitly asks for it.
+        return False
 
     def __post_init__(self):
         self.method = _normalize_quant_method(self.method)
@@ -3042,6 +3175,10 @@ class AWQConfig(PreProcessorConfig):
         out["zero_point"] = not self.sym
         out["version"] = self.format
         out[FORMAT_FIELD_CODE] = self.format
+
+    def _update_meta_payload(self, meta_payload: Dict[str, Any]) -> None:
+        super()._update_meta_payload(meta_payload)
+        meta_payload["scale_search_chunked_activations"] = self.scale_search_chunked_activations
 
 
 @dataclass
@@ -3594,13 +3731,18 @@ class EXL3Config(BaseQuantizeConfig):
             self.meta = {}
 
         self.adapter = normalize_adapter(self.adapter)
+        self._ensure_offload_temp_dir()
 
-        if self.offload_to_disk and not self.offload_to_disk_path:
-            path_key = f"{get_random_string()}-{get_random_string()}"
-            self.offload_to_disk_path = f"./gptqmodel_offload/{path_key}/"
-            log.info(f"QuantizeConfig: offload_to_disk_path auto set to `{self.offload_to_disk_path}`")
-
-        self.vram_strategy = _normalize_vram_strategy(self.vram_strategy)
+        self.dense_vram_strategy = _normalize_dense_vram_strategy(self.dense_vram_strategy)
+        self.dense_vram_strategy_devices = _normalize_strategy_devices(
+            self.dense_vram_strategy_devices,
+            field_name="dense_vram_strategy_devices",
+        )
+        self.moe_vram_strategy = _normalize_moe_vram_strategy(self.moe_vram_strategy)
+        self.moe_vram_strategy_devices = _normalize_strategy_devices(
+            self.moe_vram_strategy_devices,
+            field_name="moe_vram_strategy_devices",
+        )
         self.gc_mode = _normalize_gc_mode(self.gc_mode)
         self.moe = _normalize_moe_config(self.moe)
 
@@ -3745,7 +3887,10 @@ class GGUFConfig(PreProcessorConfig):
                 "gc_mode",
                 "wait_for_submodule_finalizers",
                 "auto_forward_data_parallel",
-                "vram_strategy",
+                "dense_vram_strategy",
+                "dense_vram_strategy_devices",
+                "moe_vram_strategy",
+                "moe_vram_strategy_devices",
                 "weight_only",
             ):
                 meta_payload.pop(key, None)

@@ -62,7 +62,7 @@ from ..utils.importer import (
 from ..utils.inspect import safe_kwargs_call
 from ..utils.logger import setup_logger
 from ..utils.machete import _validate_machete_device_support
-from ..utils.marlin import _validate_marlin_device_support
+from ..utils.marlin import _marlin_capability_supported, _validate_marlin_device_support
 from ..utils.model import (
     auto_dtype,
     convert_gptq_v1_to_v2_format,
@@ -656,6 +656,11 @@ def ModelLoader(cls):
                     model_local_path=model_local_path,
                     config=model.config,
                     model_init_kwargs=shell_model_init_kwargs,
+                    module_tree=copy.deepcopy(getattr(cls, "module_tree", None)),
+                    hf_conversion_map_reversed=copy.deepcopy(
+                        cls.resolve_hf_conversion_map_reversed(target_model=model)
+                    ),
+                    target_model=model,
                 )
 
                 if turtle_model is None:
@@ -962,8 +967,8 @@ def ModelLoader(cls):
 
         if format_code == FORMAT.MARLIN:
             # format marlin requires marlin kernel
-            expected_marlin_backends = [BACKEND.AWQ_MARLIN] if qcfg.quant_method == METHOD.AWQ else [BACKEND.GPTQ_MARLIN]
-            expected_marlin_backend = expected_marlin_backends[0]
+            expected_marlin_backend = BACKEND.AWQ_MARLIN if qcfg.quant_method == METHOD.AWQ else BACKEND.GPTQ_MARLIN
+            expected_marlin_backends = [expected_marlin_backend]
             if backend not in expected_marlin_backends and backend != BACKEND.AUTO:
                 raise TypeError(
                     f"FORMAT.MARLIN requires BACKEND.AUTO or BACKEND.{expected_marlin_backend.name}: actual = `{backend}`."
@@ -1359,18 +1364,30 @@ def ModelLoader(cls):
                 raise ValueError(
                     "Format: The loading of sharded checkpoints with Marlin is currently not supported."
                 )
-            if not _validate_marlin_device_support():
-                raise ValueError(
-                    f"Kernel: Marlin kernel does not support this gpu with compute capability of "
-                    f"`{torch.cuda.get_device_capability()}`. Please do not use this Marlin backend."
-                )
+            device_capability = torch.cuda.get_device_capability()
+            if backend == BACKEND.GPTQ_MARLIN:
+                if not _validate_marlin_device_support():
+                    raise ValueError(
+                        "Kernel: Marlin kernel requires compute capability >= 7.5 for the "
+                        f"GPTQ Marlin backend. Detected capability: `{device_capability}`."
+                    )
+                if device_capability == (7, 5) and dtype == torch.bfloat16:
+                    raise ValueError(
+                        "Kernel: GPTQ Marlin on Turing (compute capability 7.5) supports "
+                        "dtype=torch.float16 only."
+                    )
+            elif backend == BACKEND.AWQ_MARLIN:
+                if not _marlin_capability_supported(*device_capability) or device_capability[0] < 8:
+                    raise ValueError(
+                        "Kernel: AWQ Marlin requires compute capability >= 8.0. "
+                        f"Detected capability: `{device_capability}`."
+                    )
 
-            # GPTQ Marlin supports fp16 and bf16 compute, while AWQ Marlin
-            # remains fp16-only for now.
+            # GPTQ Marlin and AWQ Marlin support fp16 and bf16 compute on Ampere+.
             if backend == BACKEND.GPTQ_MARLIN and dtype not in (torch.float16, torch.bfloat16):
                 raise ValueError("Marlin kernel requires dtype=torch.float16 or dtype=torch.bfloat16.")
-            if backend == BACKEND.AWQ_MARLIN and dtype != torch.float16:
-                raise ValueError("AWQ Marlin kernel requires dtype=torch.float16.")
+            if backend == BACKEND.AWQ_MARLIN and dtype not in (torch.float16, torch.bfloat16):
+                raise ValueError("AWQ Marlin kernel requires dtype=torch.float16 or dtype=torch.bfloat16.")
 
 
         if backend in [BACKEND.GPTQ_BITBLAS, BACKEND.AWQ_BITBLAS]:

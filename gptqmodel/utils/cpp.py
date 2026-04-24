@@ -10,14 +10,17 @@ import logging
 import math
 import os
 import shutil
+import subprocess
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Optional, Sequence
 
+import pcre
 import torch
-from torch.utils.cpp_extension import CUDA_HOME, _get_build_directory, load
+from torch.utils.cpp_extension import CUDA_HOME, _get_build_directory, _get_cuda_arch_flags, load
 
 from .env import env_flag
 from .jit_compile_baselines import get_jit_compile_baseline_seconds
@@ -45,10 +48,67 @@ _cpp_ext_initialized = False
 _SHARED_LIBRARY_SUFFIXES = (".so", ".pyd", ".dylib", ".dll")
 _COMPILE_PROGRESS_TOTAL_STEPS = 100
 _COMPILE_PROGRESS_INTERVAL_SECONDS = 1.0
+_LOCAL_INCLUDE_PATTERN = pcre.compile(
+    r'^\s*#\s*include\s+"([^"]+)"',
+    flags=pcre.Flag.MULTILINE,
+)
+_NVCC_RELEASE_PATTERN = pcre.compile(r"release\s+(\d+)\.(\d+)")
+_NVCC_VERSION_LOCK = threading.Lock()
+_NVCC_VERSION_CACHE: tuple[int, int] | None = None
 # Default NVCC internal threading for JIT builds. This is based on clean-build
 # timings collected on an AMD Zen 3 CPU running at 2.2 GHz, where 8 threads was
 # the best overall tradeoff across Marlin, AWQ, QQQ, ExLlama, and ParoQuant.
 _DEFAULT_NVCC_THREADS = "8"
+_GLOBAL_KERNEL_REBUILD_ENV = "GPTQMODEL_KERNEL_REBUILD"
+_TORCH_OPS_BUILD_ROOT_ENV = "GPTQMODEL_TORCH_EXTENSIONS_DIR"
+
+
+def _nvcc_path() -> Optional[str]:
+    return shutil.which("nvcc")
+
+
+def _nvcc_text(*args: str) -> str:
+    nvcc_path = _nvcc_path()
+    if not nvcc_path:
+        return ""
+
+    try:
+        result = subprocess.run(
+            [nvcc_path, *args],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return ""
+
+    return ((result.stdout or "") + "\n" + (result.stderr or "")).strip()
+
+
+def _nvcc_version() -> tuple[int, int]:
+    global _NVCC_VERSION_CACHE
+
+    with _NVCC_VERSION_LOCK:
+        if _NVCC_VERSION_CACHE is not None:
+            return _NVCC_VERSION_CACHE
+
+        version_text = _nvcc_text("--version")
+        match = _NVCC_RELEASE_PATTERN.search(version_text)
+        if match:
+            _NVCC_VERSION_CACHE = (int(match.group(1)), int(match.group(2)))
+        else:
+            _NVCC_VERSION_CACHE = (0, 0)
+        return _NVCC_VERSION_CACHE
+
+
+def nvcc_version_at_least(major: int, minor: int) -> bool:
+    return _nvcc_version() >= (major, minor)
+
+
+def is_nvcc_compatible() -> bool:
+    """Return whether nvcc is new enough for required JIT kernel flags."""
+
+    return nvcc_version_at_least(12, 8)
 
 
 def _format_compile_duration_seconds(seconds: float) -> str:
@@ -212,6 +272,9 @@ class _CompileProgressDisplay:
 def default_torch_ops_build_root(subdir: str) -> Path:
     """Return the default on-disk cache root for torch.ops JIT extensions."""
 
+    override_root = os.getenv(_TORCH_OPS_BUILD_ROOT_ENV)
+    if override_root:
+        return Path(override_root).expanduser() / subdir
     return Path.home() / ".cache" / "gptqmodel" / "torch_extensions" / subdir
 
 
@@ -246,6 +309,27 @@ def detected_cuda_wheel_include_paths() -> list[str]:
             if candidate.is_dir():
                 include_paths.append(str(candidate))
     return _dedupe_path_strings(include_paths)
+
+
+def _resolve_local_include_path(
+    include_name: str,
+    *,
+    including_path: Path,
+    include_search_roots: Sequence[Path],
+) -> Optional[Path]:
+    """Resolve one quoted local include against the current file and explicit include roots."""
+
+    include_path = Path(include_name).expanduser()
+    if include_path.is_absolute():
+        resolved = include_path.resolve(strict=False)
+        return resolved if resolved.exists() else None
+
+    search_roots = [including_path.parent, *include_search_roots]
+    for root in search_roots:
+        candidate = (root / include_path).resolve(strict=False)
+        if candidate.exists():
+            return candidate
+    return None
 
 
 def detected_local_cuda_include_paths() -> list[str]:
@@ -290,6 +374,107 @@ def cuda_include_paths_with_fallback(
     if not _detected_local_cuda_has_required_headers(required_header_names):
         resolved_include_paths.extend(detected_cuda_wheel_include_paths())
     return _dedupe_path_strings(resolved_include_paths)
+
+
+_CUDA_ARCH_TOKEN_RE = pcre.compile(r"^(?P<major>\d+)\.(?P<minor>\d+)(?:\+PTX)?$")
+
+
+def _supported_cuda_arch_pairs() -> list[tuple[int, int]]:
+    pairs: set[tuple[int, int]] = set()
+    for arch in getattr(torch.cuda, "get_arch_list", lambda: [])():
+        if not isinstance(arch, str) or not arch.startswith("sm_"):
+            continue
+        sm = arch.split("_", 1)[1].rstrip("af")
+        if not sm.isdigit() or len(sm) < 2:
+            continue
+        pairs.add((int(sm[:-1]), int(sm[-1])))
+    return sorted(pairs)
+
+
+def _clamp_visible_cuda_capability(capability: tuple[int, int]) -> tuple[int, int]:
+    supported = _supported_cuda_arch_pairs()
+    if not supported:
+        return capability
+    return min(max(supported), capability)
+
+
+def _visible_cuda_arch_tokens() -> list[str]:
+    if not torch.cuda.is_available():
+        return []
+
+    tokens: list[str] = []
+    seen: set[str] = set()
+    for device_index in range(torch.cuda.device_count()):
+        major, minor = _clamp_visible_cuda_capability(torch.cuda.get_device_capability(device_index))
+        token = f"{major}.{minor}"
+        if token not in seen:
+            seen.add(token)
+            tokens.append(token)
+    return tokens
+
+
+def _merge_cuda_arch_override_with_visible_caps(raw_override: str) -> str:
+    requested_tokens: list[str] = []
+    requested_bases: set[str] = set()
+    for token in pcre.split(r"[;\s,]+", raw_override.strip()):
+        if not token:
+            continue
+        requested_tokens.append(token)
+        match = _CUDA_ARCH_TOKEN_RE.match(token)
+        if match:
+            requested_bases.add(f"{int(match.group('major'))}.{int(match.group('minor'))}")
+
+    for token in _visible_cuda_arch_tokens():
+        if token not in requested_bases:
+            requested_tokens.append(token)
+            requested_bases.add(token)
+
+    return ";".join(requested_tokens)
+
+
+def _effective_cuda_arch_flags(*, merge_visible_caps: bool) -> list[str]:
+    """Return the effective NVCC arch flags Torch will emit for this host."""
+
+    override = os.getenv("TORCH_CUDA_ARCH_LIST")
+    try:
+        if override and merge_visible_caps:
+            merged_override = _merge_cuda_arch_override_with_visible_caps(override)
+            if merged_override != override:
+                os.environ["TORCH_CUDA_ARCH_LIST"] = merged_override
+                try:
+                    return list(_get_cuda_arch_flags())
+                finally:
+                    os.environ["TORCH_CUDA_ARCH_LIST"] = override
+        return list(_get_cuda_arch_flags())
+    except Exception:
+        return []
+
+
+@contextmanager
+def _temporary_merged_cuda_arch_override(*, enabled: bool = True):
+    """Temporarily include the visible CUDA capability in manual arch overrides."""
+
+    override = os.getenv("TORCH_CUDA_ARCH_LIST")
+    if not enabled or not override:
+        yield
+        return
+
+    merged_override = _merge_cuda_arch_override_with_visible_caps(override)
+    if merged_override == override:
+        yield
+        return
+
+    os.environ["TORCH_CUDA_ARCH_LIST"] = merged_override
+    try:
+        yield
+    finally:
+        os.environ["TORCH_CUDA_ARCH_LIST"] = override
+
+
+def resolved_cuda_arch_flags() -> list[str]:
+    """Return the effective NVCC arch flags Torch will emit for this host."""
+
+    return _effective_cuda_arch_flags(merge_visible_caps=True)
 
 
 def torch_cxx11_abi_flag() -> int:
@@ -358,6 +543,7 @@ def default_jit_cuda_cflags(
     include_ptxas_verbosity: bool = True,
     include_fatbin_compression: bool = False,
     include_diag_suppress: bool = False,
+    nvcc_threads: str | int | None = None,
 ) -> list[str]:
     """Return the common NVCC flags for torch.ops JIT CUDA extensions."""
 
@@ -369,7 +555,8 @@ def default_jit_cuda_cflags(
     )
 
     if include_nvcc_threads:
-        flags.extend(["--threads", os.getenv("NVCC_THREADS", _DEFAULT_NVCC_THREADS)])
+        resolved_nvcc_threads = str(nvcc_threads) if nvcc_threads is not None else os.getenv("NVCC_THREADS", _DEFAULT_NVCC_THREADS)
+        flags.extend(["--threads", resolved_nvcc_threads])
         if resolved_opt_level is not None:
             optimization_level = (
                 resolved_opt_level[1:] if resolved_opt_level.startswith("O") else resolved_opt_level
@@ -410,6 +597,7 @@ class TorchOpsJitExtension:
         force_rebuild_env: Optional[str] = None,
         verbose_env: Optional[str] = None,
         requires_cuda: bool = False,
+        merge_visible_cuda_arch_override: bool = True,
         binary_names: Optional[Sequence[str]] = None,
     ) -> None:
         self.name = name
@@ -426,6 +614,7 @@ class TorchOpsJitExtension:
         self.force_rebuild_env = force_rebuild_env
         self.verbose_env = verbose_env
         self.requires_cuda = bool(requires_cuda)
+        self.merge_visible_cuda_arch_override = bool(merge_visible_cuda_arch_override)
         self.binary_names = tuple(binary_names or (name,))
         self.compile_baseline_seconds = get_jit_compile_baseline_seconds(name)
         self._load_attempted = False
@@ -469,6 +658,47 @@ class TorchOpsJitExtension:
             return Path(override).expanduser()
         return self._resolve_path(self.default_build_root)
 
+    def _source_cache_fingerprint_payload(self, source: str, include_paths: Sequence[str]) -> list[str]:
+        """Hash one source file plus recursively discovered quoted local includes."""
+
+        payload: list[str] = []
+        visited: set[Path] = set()
+        include_search_roots = [Path(path).expanduser().resolve(strict=False) for path in include_paths]
+
+        def visit(path: Path) -> None:
+            normalized = path.expanduser().resolve(strict=False)
+            if normalized in visited:
+                return
+            visited.add(normalized)
+            payload.append(str(normalized))
+
+            if not normalized.exists():
+                payload.append("missing")
+                return
+
+            try:
+                source_bytes = normalized.read_bytes()
+            except OSError as exc:
+                payload.append(f"read_error={type(exc).__name__}")
+                return
+
+            payload.append(hashlib.sha256(source_bytes).hexdigest())
+
+            source_text = source_bytes.decode("utf-8", errors="ignore")
+            for include_name in _LOCAL_INCLUDE_PATTERN.findall(source_text):
+                included_path = _resolve_local_include_path(
+                    include_name,
+                    including_path=normalized,
+                    include_search_roots=include_search_roots,
+                )
+                if included_path is None:
+                    payload.append(f"missing_include={normalized}:{include_name}")
+                    continue
+                visit(included_path)
+
+        visit(Path(source))
+        return payload
+
     def _cache_fingerprint(self) -> str:
         """Hash the effective op surface and source metadata to avoid stale cache reuse."""
 
@@ -477,19 +707,13 @@ class TorchOpsJitExtension:
         payload.append(f"torch={torch.__version__}")
         payload.append(f"torch_cuda={torch.version.cuda or 'none'}")
         payload.extend(self._cuda_cache_fingerprint_payload())
+        include_paths = self._resolved_extra_include_paths()
         for source in self._resolve_sequence(self.sources):
-            payload.append(source)
-            source_path = Path(source)
-            if source_path.exists():
-                stat = source_path.stat()
-                payload.append(str(stat.st_size))
-                payload.append(str(stat.st_mtime_ns))
-            else:
-                payload.append("missing")
+            payload.extend(self._source_cache_fingerprint_payload(source, include_paths))
 
         payload.extend(self._resolve_sequence(self.extra_cflags))
         payload.extend(self._resolve_sequence(self.extra_cuda_cflags))
-        payload.extend(self._resolved_extra_include_paths())
+        payload.extend(include_paths)
         payload.extend(self._resolve_sequence(self.extra_ldflags))
         digest = hashlib.sha256("\0".join(payload).encode("utf-8")).hexdigest()
         return digest[:16]
@@ -500,12 +724,20 @@ class TorchOpsJitExtension:
         if not self.requires_cuda:
             return ["cuda_ext=0"]
 
+        payload = ["cuda_ext=1"]
         override = os.getenv("TORCH_CUDA_ARCH_LIST")
         if override:
-            return ["cuda_ext=1", f"arch_list={override}"]
+            payload.append(f"arch_list={override}")
+            arch_flags = _effective_cuda_arch_flags(
+                merge_visible_caps=self.merge_visible_cuda_arch_override
+            )
+            if arch_flags:
+                payload.append(f"resolved_arch_flags={','.join(arch_flags)}")
+            return payload
 
         if not torch.cuda.is_available():
-            return ["cuda_ext=1", "cuda_available=0"]
+            payload.append("cuda_available=0")
+            return payload
 
         capabilities: set[str] = set()
         for device_index in range(torch.cuda.device_count()):
@@ -513,8 +745,14 @@ class TorchOpsJitExtension:
             capabilities.add(f"{major}.{minor}")
 
         if not capabilities:
-            return ["cuda_ext=1", "visible_caps=none"]
-        return ["cuda_ext=1", f"visible_caps={','.join(sorted(capabilities))}"]
+            payload.append("visible_caps=none")
+        else:
+            payload.append(f"visible_caps={','.join(sorted(capabilities))}")
+
+        arch_flags = resolved_cuda_arch_flags()
+        if arch_flags:
+            payload.append(f"resolved_arch_flags={','.join(arch_flags)}")
+        return payload
 
     def build_root(self) -> Path:
         """Return the fingerprinted filesystem directory that caches this JIT extension."""
@@ -524,6 +762,8 @@ class TorchOpsJitExtension:
     def force_rebuild_enabled(self) -> bool:
         """Check whether this extension should ignore and replace cached binaries."""
 
+        if env_flag(_GLOBAL_KERNEL_REBUILD_ENV, default=False):
+            return True
         if not self.force_rebuild_env:
             return False
         return env_flag(self.force_rebuild_env, default=False)
@@ -659,9 +899,11 @@ class TorchOpsJitExtension:
             started = time.perf_counter()
             build_invocation_succeeded = False
             try:
+                resolved_sources = self._resolve_sequence(self.sources)
+                extra_include_paths = self._resolved_extra_include_paths()
                 kwargs = {
                     "name": self.name,
-                    "sources": self._resolve_sequence(self.sources),
+                    "sources": resolved_sources,
                     "build_directory": str(build_root),
                     "is_python_module": False,
                     "verbose": env_flag(self.verbose_env, default=False) if self.verbose_env else False,
@@ -672,14 +914,15 @@ class TorchOpsJitExtension:
                 extra_cuda_cflags = self._resolve_sequence(self.extra_cuda_cflags)
                 if extra_cuda_cflags:
                     kwargs["extra_cuda_cflags"] = extra_cuda_cflags
-                extra_include_paths = self._resolved_extra_include_paths()
                 if extra_include_paths:
                     kwargs["extra_include_paths"] = extra_include_paths
                 extra_ldflags = self._resolve_sequence(self.extra_ldflags)
                 if extra_ldflags:
                     kwargs["extra_ldflags"] = extra_ldflags
-
-                load(**kwargs)
+                with _temporary_merged_cuda_arch_override(
+                    enabled=self.merge_visible_cuda_arch_override
+                ):
+                    load(**kwargs)
                 build_invocation_succeeded = True
             except Exception as exc:  # pragma: no cover - build depends on host toolchain
                 elapsed = time.perf_counter() - started

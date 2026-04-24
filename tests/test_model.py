@@ -31,7 +31,8 @@ from torch import nn
 from gptqmodel import GPTQModel, QuantizeConfig  # noqa: E402
 from gptqmodel.looper.module_looper import ModuleLooper, StopMainLoop
 from gptqmodel.models import loader
-from gptqmodel.models.auto import _hide_unsupported_quantization_config_for_lm_eval, _is_supported_quantization_config
+from gptqmodel.models.auto import _hide_unsupported_quantization_config_for_eval, _is_supported_quantization_config
+from gptqmodel.models.definitions.phi4 import Phi4MMGPTQ
 
 
 ############ test_model_dequant.py ############
@@ -432,6 +433,11 @@ class DummyRequirePkgModel:
     require_pkgs = ["fakepkg>=1.0.0"]
 
 
+def test_phi4_model_definition_requires_required_packages():
+    assert "backoff>=2.2.1" in Phi4MMGPTQ.require_pkgs
+    assert "optimum>=1.24.0" in Phi4MMGPTQ.require_pkgs
+
+
 def test_check_versions_passes_when_version_matches(monkeypatch):
     monkeypatch.setattr(loader, "version", lambda _: "1.0.0")
 
@@ -662,7 +668,7 @@ def test_emit_layer_complete_stops_cleanly_on_stop_main_loop(monkeypatch):
     assert looper._check_loop_stop() is True
 
 
-def test_hide_unsupported_quantization_config_for_lm_eval_temporarily_clears_gguf_bits():
+def test_hide_unsupported_quantization_config_for_eval_temporarily_clears_gguf_bits():
     quantization_config = {
         "quant_method": "gguf",
         "format": "gguf",
@@ -672,13 +678,13 @@ def test_hide_unsupported_quantization_config_for_lm_eval_temporarily_clears_ggu
         config=types.SimpleNamespace(quantization_config=dict(quantization_config))
     )
 
-    with _hide_unsupported_quantization_config_for_lm_eval(model):
+    with _hide_unsupported_quantization_config_for_eval(model):
         assert model.config.quantization_config is None
 
     assert model.config.quantization_config == quantization_config
 
 
-def test_hide_unsupported_quantization_config_for_lm_eval_leaves_supported_gptq_alone():
+def test_hide_unsupported_quantization_config_for_eval_leaves_supported_gptq_alone():
     quantization_config = {
         "quant_method": "gptq",
         "bits": 4,
@@ -688,7 +694,7 @@ def test_hide_unsupported_quantization_config_for_lm_eval_leaves_supported_gptq_
         config=types.SimpleNamespace(quantization_config=dict(quantization_config))
     )
 
-    with _hide_unsupported_quantization_config_for_lm_eval(model):
+    with _hide_unsupported_quantization_config_for_eval(model):
         assert model.config.quantization_config == quantization_config
 
     assert model.config.quantization_config == quantization_config
