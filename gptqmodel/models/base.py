@@ -27,7 +27,6 @@ from transformers import (
     modeling_utils,
 )
 
-
 try:  # Optional dependency for huggingface datasets support
     from datasets import Dataset as HFDataset
     from datasets import IterableDataset as HFIterableDataset
@@ -230,6 +229,12 @@ class BaseQModel(nn.Module):
 
     # some models have broken attention mask codes so we need to only use batch 1 with no masks
     support_batch_quantize = True
+
+    # Whether this model should publish a layer's KV tuple into the shared
+    # replay cache even when that same layer does not consume `kv_last_layer`.
+    # Models like "hymba" need some layers to write KV for later layers even if
+    # the current layer itself does not consume `kv_last_layer`.
+    write_shared_kv_cache = False
 
     # allow models to define optional notes that output messages to users that want to use this model
     # list of supported keys: [ "notes" = print the notes value on model load ]
@@ -1271,6 +1276,13 @@ class BaseQModel(nn.Module):
         use_cache: bool,
         data_device: torch.device,
     ):
+        input_ids = example.get("input_ids")
+        if torch.is_tensor(input_ids):
+            input_ids = self._sanitize_input_ids_for_embeddings(input_ids)
+            if input_ids is not example.get("input_ids"):
+                example = dict(example)
+                example["input_ids"] = input_ids
+
         if self.INPUT_EMBEDDING_EXTRA_ARGS:
             return self.model.generate(
                 **example,
@@ -1278,6 +1290,51 @@ class BaseQModel(nn.Module):
             )
 
         return self.model(**example, use_cache=use_cache)
+
+    def _sanitize_input_ids_for_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+        if input_ids.dtype not in (torch.int32, torch.int64):
+            return input_ids
+
+        if input_ids.numel() == 0:
+            return input_ids
+
+        embedder = getattr(self.model, "get_input_embeddings", None)
+        if not callable(embedder):
+            return input_ids
+
+        embedding = embedder()
+        if embedding is None or not hasattr(embedding, "num_embeddings"):
+            return input_ids
+
+        vocab_size = int(getattr(embedding, "num_embeddings", 0) or 0)
+        if vocab_size <= 0:
+            return input_ids
+
+        invalid_mask = (input_ids < 0) | (input_ids >= vocab_size)
+        if not bool(invalid_mask.any()):
+            return input_ids
+
+        tokenizer = getattr(self, "tokenizer", None)
+        replacement_token_id = None
+        for attr_name in ("unk_token_id", "pad_token_id", "eos_token_id", "bos_token_id"):
+            candidate = getattr(tokenizer, attr_name, None) if tokenizer is not None else None
+            if isinstance(candidate, int) and 0 <= candidate < vocab_size:
+                replacement_token_id = candidate
+                break
+        if replacement_token_id is None:
+            replacement_token_id = 0
+
+        sanitized = input_ids.clone()
+        sanitized[invalid_mask] = replacement_token_id
+
+        invalid_count = int(invalid_mask.sum().item())
+        log.warning(
+            "Input capture: replaced %s out-of-range token ids with %s (valid range: [0, %s)).",
+            invalid_count,
+            replacement_token_id,
+            vocab_size,
+        )
+        return sanitized
 
     def _generate_with_runtime(self, runtime_generate, inputs=None, **kwargs):
         def _normalize_generate_attention_mask(input_ids, attention_mask):
