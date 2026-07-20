@@ -100,7 +100,7 @@ jobs:
       cuda_version: ${{ env.CUDA_VERSION }}
     steps:
       - name: Checkout Codes
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: ${{ env.repo }}
           ref: ${{ env.ref }}
@@ -132,7 +132,7 @@ jobs:
 
     steps:
       - name: Checkout Codes
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: ${{ env.repo }}
           ref: ${{ env.ref }}
@@ -262,7 +262,7 @@ jobs:
             install_cmd: uv pip install . torch -U
     steps:
       - name: Checkout Codes
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: ${{ env.repo }}
           ref: ${{ env.ref }}
